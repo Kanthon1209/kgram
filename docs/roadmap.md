@@ -4,7 +4,7 @@
 
 ## P0 — OpenIM + Compose 跑通
 
-- [ ] 按官方文档在本地通过 Docker Compose 启动 OpenIM 核心组件。
+- [x] 按官方文档在本地通过 Docker Compose 启动 OpenIM 核心组件。（demo ECS `8.136.150.149`，见 deploy/openim/ENDPOINTS.md；2Gi 内存紧张，chat 可能 OOM）
 - [ ] 与本仓库 `deploy/docker-compose.yml` 整合或文档化合并方式。
 - [ ] `scripts/bootstrap.sh` 与 README 中的起步路径可复现（新人 30 分钟内能拉起依赖栈骨架）。
 

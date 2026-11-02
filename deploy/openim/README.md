@@ -20,3 +20,19 @@ kgram **不在此仓库复制 OpenIM Server 源码**；本地与测试环境应�
 ## 客户端对接
 
 Android fork 就绪后，使用 **OpenIM Client SDK** 连接上述服务；网关暂不替代 OpenIM 长连接，仅负责 LiveKit 等横切能力。
+
+## Demo ECS (current)
+
+Public demo host (Aliyun Hangzhou): **`8.136.150.149`**
+
+See [ENDPOINTS.md](./ENDPOINTS.md) and [openim.env.example](./openim.env.example).
+
+| Service | URL |
+|---------|-----|
+| Chat / Register | `http://8.136.150.149:10008` |
+| OpenIM API | `http://8.136.150.149:10002` |
+| OpenIM WS | `ws://8.136.150.149:10001` |
+
+Android register wiring notes: [android/REGISTER_OPENIM.md](../../android/REGISTER_OPENIM.md).
+
+Server files live under `/opt/kgram/openim-docker` on that ECS (not copied into this repo).
