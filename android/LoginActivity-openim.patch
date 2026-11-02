@@ -1,0 +1,167 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java
+index de2413c..e1913a4 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/LoginActivity.java
+@@ -126,6 +126,8 @@ import org.telegram.messenger.AuthTokensHelper;
+ import org.telegram.messenger.BillingController;
+ import org.telegram.messenger.BuildConfig;
+ import org.telegram.messenger.BuildVars;
++import org.telegram.messenger.kgram.KgramServerConfig;
++import org.telegram.messenger.kgram.OpenIMChatClient;
+ import org.telegram.messenger.CallReceiver;
+ import org.telegram.messenger.ContactsController;
+ import org.telegram.messenger.Emoji;
+@@ -3145,6 +3147,16 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
+                 }
+             }
+ 
++            // kgram: route login/register to OpenIM Chat API (not Telegram MTProto DCs)
++            if (KgramServerConfig.USE_OPENIM_AUTH && activityMode == MODE_LOGIN) {
++                final String areaCode = "+" + PhoneFormat.stripExceptNumbers(codeField.getText().toString());
++                final String phoneNumberOnly = PhoneFormat.stripExceptNumbers(phoneField.getText().toString());
++                nextPressed = true;
++                needShowProgress(0);
++                showOpenIMAuthDialog(areaCode, phoneNumberOnly);
++                return;
++            }
++
+             TLObject req;
+             if (activityMode == MODE_CHANGE_PHONE_NUMBER) {
+                 TL_account.sendChangePhoneCode changePhoneCode = new TL_account.sendChangePhoneCode();
+@@ -3510,6 +3522,136 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
+                 countryButton.getCurrentView().invalidate();
+             }
+         }
++
++        /** kgram: collect password/nickname then POST OpenIM Chat register (fallback login). */
++        private void showOpenIMAuthDialog(final String areaCode, final String phoneNumber) {
++            if (getParentActivity() == null) {
++                nextPressed = false;
++                needHideProgress(false);
++                return;
++            }
++            Context ctx = getParentActivity();
++            LinearLayout layout = new LinearLayout(ctx);
++            layout.setOrientation(LinearLayout.VERTICAL);
++            int pad = AndroidUtilities.dp(24);
++            layout.setPadding(pad, AndroidUtilities.dp(8), pad, 0);
++
++            final EditText nickField = new EditText(ctx);
++            nickField.setHint("Nickname");
++            nickField.setText("kgram_" + phoneNumber);
++            nickField.setSingleLine(true);
++            layout.addView(nickField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
++
++            final EditText passField = new EditText(ctx);
++            passField.setHint("Password (min 6)");
++            passField.setSingleLine(true);
++            passField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
++            passField.setTransformationMethod(PasswordTransformationMethod.getInstance());
++            layout.addView(passField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 12, 0, 0));
++
++            TextView hint = new TextView(ctx);
++            hint.setText("OpenIM @" + KgramServerConfig.CHAT_API + "\nverifyCode=" + KgramServerConfig.SUPER_VERIFY_CODE);
++            hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12);
++            hint.setPadding(0, AndroidUtilities.dp(8), 0, 0);
++            layout.addView(hint);
++
++            AlertDialog.Builder builder = new AlertDialog.Builder(ctx);
++            builder.setTitle("kgram OpenIM");
++            builder.setView(layout);
++            builder.setNegativeButton(getString(R.string.Cancel), (d, w) -> {
++                nextPressed = false;
++                needHideProgress(false);
++            });
++            builder.setNeutralButton("Login", null);
++            builder.setPositiveButton("Register", null);
++            final AlertDialog dialog = builder.create();
++            dialog.setOnCancelListener(d -> {
++                nextPressed = false;
++                needHideProgress(false);
++            });
++            dialog.setOnShowListener(d -> {
++                dialog.getButton(Dialog.BUTTON_POSITIVE).setOnClickListener(v -> {
++                    String password = passField.getText().toString();
++                    String nickname = nickField.getText().toString().trim();
++                    if (password.length() < 6) {
++                        needShowAlert("kgram", "Password must be at least 6 characters");
++                        return;
++                    }
++                    dialog.dismiss();
++                    runOpenIMRegisterOrLogin(areaCode, phoneNumber, password, nickname, true);
++                });
++                dialog.getButton(Dialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
++                    String password = passField.getText().toString();
++                    if (password.length() < 6) {
++                        needShowAlert("kgram", "Password must be at least 6 characters");
++                        return;
++                    }
++                    dialog.dismiss();
++                    runOpenIMRegisterOrLogin(areaCode, phoneNumber, password, null, false);
++                });
++            });
++            showDialog(dialog);
++            needHideProgress(false);
++        }
++
++        private void runOpenIMRegisterOrLogin(final String areaCode, final String phoneNumber, final String password, final String nickname, final boolean registerFirst) {
++            needShowProgress(0);
++            nextPressed = true;
++            OpenIMChatClient.Callback cb = result -> AndroidUtilities.runOnUIThread(() -> {
++                if (result.ok()) {
++                    persistOpenIMSession(areaCode, phoneNumber, result);
++                    nextPressed = false;
++                    needHideProgress(false);
++                    needShowAlert("kgram OpenIM OK",
++                            "userID=" + result.userID + "\n"
++                                    + "imToken saved\n"
++                                    + "API " + KgramServerConfig.IM_API + "\n"
++                                    + "WS " + KgramServerConfig.IM_WS + "\n"
++                                    + "(TG main session not wired yet — register hit OpenIM)");
++                    return;
++                }
++                if (registerFirst) {
++                    FileLog.d("kgram OpenIM register failed errCode=" + result.errCode + " msg=" + result.errMsg + " dlt=" + result.errDlt + " — trying login");
++                    OpenIMChatClient.loginAsync(areaCode, phoneNumber, password, result2 -> AndroidUtilities.runOnUIThread(() -> {
++                        nextPressed = false;
++                        needHideProgress(false);
++                        if (result2.ok()) {
++                            persistOpenIMSession(areaCode, phoneNumber, result2);
++                            needShowAlert("kgram OpenIM login OK", "userID=" + result2.userID + "\n(account already existed)");
++                        } else {
++                            needShowAlert("kgram OpenIM failed",
++                                    "register: " + result.errCode + " " + result.errMsg + " " + result.errDlt + "\n"
++                                            + "login: " + result2.errCode + " " + result2.errMsg + " " + result2.errDlt);
++                        }
++                    }));
++                    return;
++                }
++                nextPressed = false;
++                needHideProgress(false);
++                needShowAlert("kgram OpenIM failed", result.errCode + " " + result.errMsg + " " + result.errDlt);
++            });
++            if (registerFirst) {
++                OpenIMChatClient.registerAsync(areaCode, phoneNumber, password, nickname, cb);
++            } else {
++                OpenIMChatClient.loginAsync(areaCode, phoneNumber, password, cb);
++            }
++        }
++
++        private void persistOpenIMSession(String areaCode, String phoneNumber, OpenIMChatClient.Result result) {
++            SharedPreferences sp = ApplicationLoader.applicationContext.getSharedPreferences(KgramServerConfig.PREFS, Context.MODE_PRIVATE);
++            sp.edit()
++                    .putString("userID", result.userID)
++                    .putString("imToken", result.imToken)
++                    .putString("chatToken", result.chatToken)
++                    .putString("areaCode", areaCode)
++                    .putString("phoneNumber", phoneNumber)
++                    .putString("imApi", KgramServerConfig.IM_API)
++                    .putString("imWs", KgramServerConfig.IM_WS)
++                    .putString("chatApi", KgramServerConfig.CHAT_API)
++                    .apply();
++            FileLog.d("kgram OpenIM session saved userID=" + result.userID);
++        }
++
+     }
+ 
+     private HashSet<String> getUserPhoneNumbers() {
