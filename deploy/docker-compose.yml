@@ -1,0 +1,37 @@
+# kgram 本地开发 Compose 骨架
+#
+# 用途：先拉起可验证的 LiveKit 占位 + 网关占位；OpenIM 请按 deploy/openim/README.md
+# 对接官方 compose 后，将服务网络合并到本文件或 compose -f 多文件叠加。
+#
+# 注意：未在此伪造不可运行的 OpenIM 镜像；OpenIM 以官方文档为准。
+
+services:
+  gateway:
+    image: golang:1.22-bookworm
+    working_dir: /app
+    volumes:
+      - ../services/gateway:/app:ro
+    command: ["go", "run", "."]
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_ADDR: ":8080"
+      # LIVEKIT_API_KEY / LIVEKIT_API_SECRET 从 .env 注入，勿写入仓库
+    profiles:
+      - dev
+
+  livekit:
+    # 官方镜像；生产请 pin 具体版本 tag，并挂载真实 livekit.yaml（见 deploy/livekit/）
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml --dev
+    ports:
+      - "7880:7880"   # HTTP / WS 信令
+      - "7881:7881"   # TCP
+      - "7882:7882/udp" # RTC（本地开发简化）
+    volumes:
+      - ./livekit/livekit.yaml.example:/etc/livekit.yaml:ro
+    profiles:
+      - livekit
+
+# TODO(OpenIM): 接入 openimsdk 官方 docker-compose 中的 mysql、redis、mongo、
+# kafka、openim-api、openim-rpc-* 等组件后，在此增加 external network 或 merge 配置。

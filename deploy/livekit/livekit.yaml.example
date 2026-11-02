@@ -1,0 +1,20 @@
+# LiveKit 最小示例配置 — 复制为 livekit.yaml 并替换占位符，勿提交真实密钥
+
+port: 7880
+bind_addresses:
+  - ""
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: false
+
+# 与 gateway 签发 JWT 时使用的 key/secret 保持一致
+keys:
+  CHANGE_ME_API_KEY: CHANGE_ME_API_SECRET
+
+logging:
+  level: info
+
+# 生产环境请配置 room、webhook、turn 等，参见 LiveKit 官方文档
