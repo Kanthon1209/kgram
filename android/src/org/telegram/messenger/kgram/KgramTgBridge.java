@@ -909,11 +909,16 @@ public final class KgramTgBridge {
         String token = KgramSession.imToken(ctx);
         OpenIMWebSocket ws = OpenIMWebSocket.getInstance();
         ws.setListener(wsListener);
-        if (!wsStarted || !ws.isRunning() || !ws.isConnected()) {
+        // Only (re)start when the socket runtime is down. In-flight reconnect is owned by
+        // OpenIMWebSocket's worker; calling start() here while connecting would thrash.
+        if (!wsStarted || !ws.isRunning()) {
             wsStarted = true;
             ws.start(me, token);
-            android.util.Log.e(NOTIFY_TAG, "ensureWebSocket start/reconnect running="
+            android.util.Log.e(NOTIFY_TAG, "ensureWebSocket start running="
                     + ws.isRunning() + " connected=" + ws.isConnected());
+        } else {
+            android.util.Log.e(NOTIFY_TAG, "ensureWebSocket already running connected="
+                    + ws.isConnected());
         }
         try {
             KgramPushService.ensureStarted(ctx);
