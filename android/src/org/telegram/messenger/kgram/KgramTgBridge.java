@@ -56,6 +56,13 @@ public final class KgramTgBridge {
         @Override
         public void onConnected() {
             FileLog.d("kgram bridge ws connected");
+            try {
+                // Refresh title overlays that listen for connection state.
+                NotificationCenter.getInstance(UserConfig.selectedAccount)
+                        .postNotificationName(NotificationCenter.didUpdateConnectionState);
+            } catch (Throwable t) {
+                FileLog.e(t);
+            }
         }
 
         @Override
@@ -794,10 +801,20 @@ public final class KgramTgBridge {
         if (dialogId <= 0) {
             return;
         }
+        final int account = UserConfig.selectedAccount;
         if (watch) {
             watchedDialogs.put(dialogId, Boolean.TRUE);
+            try {
+                org.telegram.messenger.NotificationsController.getInstance(account).setOpenedDialogId(dialogId, 0);
+            } catch (Throwable ignore) {
+            }
+            KgramNotifications.cancelDialog(account, dialogId);
         } else {
             watchedDialogs.remove(dialogId);
+            try {
+                org.telegram.messenger.NotificationsController.getInstance(account).setOpenedDialogId(0, 0);
+            } catch (Throwable ignore) {
+            }
         }
     }
 
@@ -805,6 +822,10 @@ public final class KgramTgBridge {
         Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
         if (!enabled(ctx)) {
             return;
+        }
+        try {
+            KgramNotifications.ensureChannel(ctx);
+        } catch (Throwable ignore) {
         }
         String me = KgramSession.userID(ctx);
         String token = KgramSession.imToken(ctx);
@@ -1082,6 +1103,20 @@ public final class KgramTgBridge {
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages, dialogId, fresh, false, 0);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_READ_DIALOG_MESSAGE);
+        // System notification shade for inbound messages when chat is not open.
+        boolean chatOpen = Boolean.TRUE.equals(watchedDialogs.get(dialogId));
+        if (!chatOpen) {
+            String peerTitle = KgramNotifications.resolvePeerTitle(account, dialogId, peer);
+            for (MessageObject mo : fresh) {
+                if (mo == null || mo.isOut() || mo.messageOwner == null) {
+                    continue;
+                }
+                String notifPreview = mo.messageOwner.message;
+                KgramNotifications.notifyIncoming(account, dialogId, peerTitle, notifPreview, mo.getId());
+            }
+        } else {
+            KgramNotifications.cancelDialog(account, dialogId);
+        }
         FileLog.d("kgram ws inject dialog=" + dialogId + " new=" + fresh.size() + " maxSeq=" + newMax);
     }
 
