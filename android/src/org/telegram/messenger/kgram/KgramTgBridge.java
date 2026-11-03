@@ -86,6 +86,10 @@ public final class KgramTgBridge {
         if (!KgramServerConfig.USE_OPENIM_AUTH || ctx == null || !KgramSession.hasSession(ctx)) {
             return;
         }
+        try {
+            org.telegram.tgnet.ConnectionsManager.getInstance(UserConfig.selectedAccount).forceOpenImUiConnected();
+        } catch (Throwable ignore) {
+        }
         int account = UserConfig.selectedAccount;
         UserConfig uc = UserConfig.getInstance(account);
         long myId = parseUserId(KgramSession.userID(ctx));
