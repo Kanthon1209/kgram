@@ -138,9 +138,18 @@ public final class OpenIMImClient {
     }
 
     public static void searchHistoryAsync(String sendID, String recvID, String imToken, Callback<List<ChatMessage>> cb) {
+        searchHistoryAsync(sendID, recvID, imToken, 0, 100, cb);
+    }
+
+    /**
+     * @param beforeSeq exclusive upper bound (OpenIM seq). 0 = latest window ending at maxSeq.
+     * @param limit max messages to pull (clamped 1..200).
+     */
+    public static void searchHistoryAsync(String sendID, String recvID, String imToken, long beforeSeq, int limit,
+                                          Callback<List<ChatMessage>> cb) {
         EXEC.execute(() -> {
             try {
-                cb.onDone(searchHistory(sendID, recvID, imToken));
+                cb.onDone(searchHistory(sendID, recvID, imToken, beforeSeq, limit));
             } catch (Exception e) {
                 cb.onDone(new ApiResult<>(-1, e.getMessage(), "", null, null));
             }
@@ -446,8 +455,19 @@ public final class OpenIMImClient {
     }
 
     public static ApiResult<List<ChatMessage>> searchHistory(String sendID, String recvID, String imToken) throws Exception {
+        return searchHistory(sendID, recvID, imToken, 0, 100);
+    }
+
+    /**
+     * Pull conversation history by seq.
+     * beforeSeq==0 → latest window ending at server maxSeq.
+     * beforeSeq>0 → older page with end = beforeSeq-1 (exclusive upper bound of current UI oldest).
+     */
+    public static ApiResult<List<ChatMessage>> searchHistory(String sendID, String recvID, String imToken,
+                                                            long beforeSeq, int limit) throws Exception {
         // Bidirectional history via conversation pull (search_msg is one-direction only).
         String convID = singleConversationID(sendID, recvID);
+        int lim = Math.max(1, Math.min(limit <= 0 ? 100 : limit, 200));
         JSONArray conversationIDs = new JSONArray();
         conversationIDs.put(convID);
         JSONObject seqBody = new JSONObject();
@@ -470,12 +490,21 @@ public final class OpenIMImClient {
         if (maxSeq <= 0) {
             return new ApiResult<>(0, "", "", new ArrayList<ChatMessage>(), seqRaw.raw);
         }
-        long begin = Math.max(1, maxSeq - 99);
+        long end;
+        if (beforeSeq > 0) {
+            end = Math.min(maxSeq, beforeSeq - 1);
+        } else {
+            end = maxSeq;
+        }
+        if (end < 1) {
+            return new ApiResult<>(0, "", "", new ArrayList<ChatMessage>(), seqRaw.raw);
+        }
+        long begin = Math.max(1, end - lim + 1);
         JSONObject range = new JSONObject();
         range.put("conversationID", convID);
         range.put("begin", begin);
-        range.put("end", maxSeq);
-        range.put("num", 100);
+        range.put("end", end);
+        range.put("num", (int) Math.min(lim, end - begin + 1));
         JSONArray ranges = new JSONArray();
         ranges.put(range);
         JSONObject pullBody = new JSONObject();

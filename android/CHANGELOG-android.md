@@ -49,3 +49,7 @@ Fix:
 - Apply peer outbox ticks immediately via WS + one-shot server refresh on receipt/chat visible (no polling).
 - Lightweight local message cache (last ~120/conv) so reopen chat is not empty.
 
+
+## v0.1.19 — history shrink / pull-to-cloud (2026-11-03 Asia/Shanghai)
+- Root cause: cache restore stole ChatActivity `waitingForLoad` so OpenIM REST `processLoadedMessages` was dropped; `KgramMessageCache.save` overwrote fuller cache with a shorter latest window.
+- Fix: mergeAndSave only; restore only on initial fromCache; paginated `searchHistory(beforeSeq,limit)`; ChatActivity accepts cloud history after cache steal; isEnd only at seq<=1.

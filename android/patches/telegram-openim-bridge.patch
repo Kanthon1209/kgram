@@ -133,7 +133,7 @@ index 91faf80..3206a64 100644
 +        if (org.telegram.messenger.kgram.KgramServerConfig.USE_OPENIM_AUTH
 +                && org.telegram.messenger.kgram.KgramSession.hasSession(ApplicationLoader.applicationContext)
 +                && dialogId > 0 && mode == 0 && threadMessageId == 0) {
-+            if (org.telegram.messenger.kgram.KgramTgBridge.loadMessagesOpenIM(currentAccount, dialogId, count, max_id, classGuid, load_type, last_message_id, mode, loadIndex)) {
++            if (org.telegram.messenger.kgram.KgramTgBridge.loadMessagesOpenIM(currentAccount, dialogId, count, max_id, classGuid, load_type, last_message_id, mode, loadIndex, fromCache)) {
 +                return;
 +            }
 +        }

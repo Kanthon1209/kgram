@@ -1,0 +1,22 @@
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+@@ -20886,10 +20886,22 @@
+         if (index == -1) {
+             if (chatMode == MODE_SCHEDULED && mode == MODE_SCHEDULED && !isCache) {
+                 waitingForReplyMessageLoad = true;
+                 waitingForLoad.add(lastLoadIndex);
+                 getMessagesController().loadMessages(dialog_id, mergeDialogId, false, AndroidUtilities.isTablet() ? 30 : 20, 0, 0, true, 0, classGuid, 2, 0, chatMode, threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
++                return;
++            }
++            // kgram: local cache restore consumes waitingForLoad; still accept OpenIM cloud history for this chat.
++            if (!(org.telegram.messenger.kgram.KgramServerConfig.USE_OPENIM_AUTH
++                    && !isCache
++                    && mode == MODE_DEFAULT
++                    && dialog_id > 0
++                    && guid == classGuid)) {
+                 return;
+             }
+-            return;
+         } else if (!doNotRemoveLoadIndex) {
+             waitingForLoad.remove(index);
+         }

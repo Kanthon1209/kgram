@@ -22,7 +22,7 @@ import java.util.List;
 public final class KgramMessageCache {
     private KgramMessageCache() {}
 
-    private static final int MAX_PER_CONV = 120;
+    private static final int MAX_PER_CONV = 300;
     private static final Object LOCK = new Object();
 
     private static File dir(Context ctx) {

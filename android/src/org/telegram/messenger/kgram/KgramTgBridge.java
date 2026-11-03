@@ -550,6 +550,13 @@ public final class KgramTgBridge {
     public static boolean loadMessagesOpenIM(final int account, final long dialogId, final int count,
                                              final int max_id, final int classGuid, final int load_type,
                                              final int last_message_id, final int mode, final int loadIndex) {
+        return loadMessagesOpenIM(account, dialogId, count, max_id, classGuid, load_type, last_message_id, mode, loadIndex, false);
+    }
+
+    public static boolean loadMessagesOpenIM(final int account, final long dialogId, final int count,
+                                             final int max_id, final int classGuid, final int load_type,
+                                             final int last_message_id, final int mode, final int loadIndex,
+                                             final boolean fromCache) {
         Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
         if (!enabled(ctx) || dialogId <= 0 || mode != 0) {
             return false;
@@ -560,14 +567,20 @@ public final class KgramTgBridge {
         final String convID = OpenIMImClient.singleConversationID(me, peer);
         // Watching is owned by ChatActivity onResume/onPause only.
         ensureWebSocket();
-        // Instant paint from local cache so reopen is not empty while network loads.
-        restoreCachedMessages(account, me, peer, dialogId, convID, count, max_id, classGuid,
-                last_message_id, load_type, mode, loadIndex);
-        // Ensure friendship so history/send is allowed on OpenIM.
+
+        final boolean initial = max_id <= 0;
+        // Instant paint from disk only on first page. Never on older-page loads (would shrink UI).
+        if (initial && fromCache) {
+            restoreCachedMessages(account, me, peer, dialogId, convID, count, max_id, classGuid,
+                    last_message_id, load_type, mode, loadIndex);
+        }
+
+        // Always hit OpenIM REST for initial open / pull-to-refresh / older pagination (no polling).
+        final long beforeSeq = initial ? 0L : Math.max(0L, (long) max_id);
+        final int pullLimit = Math.max(count > 0 ? count : 50, 50);
         OpenIMImClient.ensureFriendAsync(me, peer, ignored -> {
             OpenIMImClient.ensureFriendAsync(peer, me, ignored2 -> {
-                OpenIMImClient.searchHistoryAsync(me, peer, token, result -> {
-                    // Also fetch peer hasReadSeq + own maxSeq in parallel-ish sequence.
+                OpenIMImClient.searchHistoryAsync(me, peer, token, beforeSeq, pullLimit, result -> {
                     java.util.ArrayList<String> ids = new java.util.ArrayList<>();
                     ids.add(convID);
                     OpenIMImClient.getHasReadAndMaxSeqAsync(me, ids, token, selfSeqRes -> {
@@ -590,6 +603,7 @@ public final class KgramTgBridge {
                     HashSet<Long> seenSeq = new HashSet<>();
                     HashSet<String> seenClient = new HashSet<>();
                     long maxSeq = 0;
+                    long minSeq = Long.MAX_VALUE;
                     int peerHasRead = 0;
                     Integer appliedOut = peerHasReadApplied.get(dialogId);
                     if (appliedOut != null) {
@@ -597,14 +611,12 @@ public final class KgramTgBridge {
                     }
                     if (peerRes != null && peerRes.ok() && peerRes.data != null) {
                         int fromApi = (int) Math.min(Math.max(peerRes.data, 0), Integer.MAX_VALUE);
-                        // Real peer read cursor from OpenIM; only advances outbox (never inbox).
                         if (fromApi > peerHasRead) {
                             peerHasRead = fromApi;
                             peerHasReadApplied.put(dialogId, peerHasRead);
                         }
                     }
                     if (result.ok() && result.data != null) {
-                        // Ascending by seq for stable TLRPC ids (older = smaller id).
                         ArrayList<OpenIMImClient.ChatMessage> sorted = new ArrayList<>(result.data);
                         sorted.sort((a, b) -> {
                             long sa = a.seq > 0 ? a.seq : a.sendTime;
@@ -617,7 +629,7 @@ public final class KgramTgBridge {
                         for (OpenIMImClient.ChatMessage m : sorted) {
                             long seq = m.seq > 0 ? m.seq : fallback;
                             if (seq > 0 && !seenSeq.add(seq)) {
-                                continue; // dedupe by seq
+                                continue;
                             }
                             if (m.clientMsgID != null && m.clientMsgID.length() > 0 && !seenClient.add(m.clientMsgID)) {
                                 continue;
@@ -640,8 +652,12 @@ public final class KgramTgBridge {
                             built.add(msg);
                             noteMessageKeys(dialogId, seq, m.clientMsgID, m.serverMsgID);
                             if (seq > maxSeq) maxSeq = seq;
+                            if (seq > 0 && seq < minSeq) minSeq = seq;
                             fallback++;
                         }
+                        // Merge into disk cache — never overwrite/truncate away other pages.
+                        KgramMessageCache.mergeAndSave(org.telegram.messenger.ApplicationLoader.applicationContext,
+                                convID, result.data);
                     }
                     if (selfSeqRes != null && selfSeqRes.ok() && selfSeqRes.data != null) {
                         OpenIMImClient.SeqInfo si = selfSeqRes.data.get(convID);
@@ -649,37 +665,41 @@ public final class KgramTgBridge {
                             maxSeq = si.maxSeq;
                         }
                     }
-                    // Telegram history is newest-first.
                     for (int i = built.size() - 1; i >= 0; i--) {
                         res.messages.add(built.get(i));
                     }
-                    // Outbox = peer hasReadSeq; inbox = we treat open chat as read up to maxSeq.
-                    int outboxMax = peerHasRead;
-                    int inboxMax = (int) Math.min(Math.max(maxSeq, 0), Integer.MAX_VALUE);
-                    mc.dialogs_read_outbox_max.put(dialogId, outboxMax);
-                    mc.dialogs_read_inbox_max.put(dialogId, inboxMax);
-                    peerHasReadApplied.put(dialogId, outboxMax);
-                    if (maxSeq > 0) {
-                        knownMaxSeq.put(dialogId, maxSeq);
-                    }
-                    TLRPC.Dialog d = mc.dialogs_dict.get(dialogId);
-                    if (d != null) {
-                        d.read_outbox_max_id = outboxMax;
-                        d.read_inbox_max_id = inboxMax;
-                        d.unread_count = 0;
+                    if (initial) {
+                        int outboxMax = peerHasRead;
+                        int inboxMax = (int) Math.min(Math.max(maxSeq, 0), Integer.MAX_VALUE);
+                        mc.dialogs_read_outbox_max.put(dialogId, outboxMax);
+                        mc.dialogs_read_inbox_max.put(dialogId, inboxMax);
+                        peerHasReadApplied.put(dialogId, outboxMax);
                         if (maxSeq > 0) {
-                            d.top_message = (int) Math.min(maxSeq, Integer.MAX_VALUE);
+                            knownMaxSeq.put(dialogId, Math.max(knownMaxSeq.get(dialogId) != null ? knownMaxSeq.get(dialogId) : 0, maxSeq));
+                        }
+                        TLRPC.Dialog d = mc.dialogs_dict.get(dialogId);
+                        if (d != null) {
+                            d.read_outbox_max_id = outboxMax;
+                            d.read_inbox_max_id = inboxMax;
+                            d.unread_count = 0;
+                            if (maxSeq > 0) {
+                                d.top_message = (int) Math.min(maxSeq, Integer.MAX_VALUE);
+                            }
                         }
                     }
-                    // Persist recent history so next open is instant.
-                    if (result.ok() && result.data != null && !result.data.isEmpty()) {
-                        KgramMessageCache.save(org.telegram.messenger.ApplicationLoader.applicationContext, convID, result.data);
+                    // isEnd only when we reached seq 1 / empty older page — keeps pagination alive.
+                    boolean isEnd;
+                    if (!result.ok()) {
+                        isEnd = false;
+                    } else if (built.isEmpty()) {
+                        isEnd = !initial; // older page empty → end; initial empty → still end-ish for UI
+                        if (initial) isEnd = true;
+                    } else {
+                        isEnd = minSeq <= 1;
                     }
-                    // isCache=false so unread is derived from outbox/inbox max maps above.
                     mc.processLoadedMessages(res, res.messages.size(), dialogId, 0, count, max_id, 0, false, classGuid,
-                            0, last_message_id, 0, 0, load_type, true, mode, 0, loadIndex, false, 0, true, false, null);
-                    // Only report inbox read while this chat is actually visible.
-                    if (maxSeq > 0 && Boolean.TRUE.equals(watchedDialogs.get(dialogId))) {
+                            0, last_message_id, 0, 0, load_type, isEnd, mode, 0, loadIndex, false, 0, true, false, null);
+                    if (initial && maxSeq > 0 && Boolean.TRUE.equals(watchedDialogs.get(dialogId))) {
                         markConversationReadOpenIM(me, peer, maxSeq, token);
                     }
                         }));
@@ -1470,6 +1490,9 @@ public final class KgramTgBridge {
                                               String convID, int count, int max_id, int classGuid,
                                               int last_message_id, int load_type, int mode, int loadIndex) {
         try {
+            if (max_id > 0) {
+                return; // older-page loads must not repaint/replace from disk cache
+            }
             Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
             List<OpenIMImClient.ChatMessage> cached = KgramMessageCache.load(ctx, convID);
             if (cached == null || cached.isEmpty()) {
@@ -1526,8 +1549,9 @@ public final class KgramTgBridge {
             if (maxSeq > 0) {
                 knownMaxSeq.put(dialogId, Math.max(knownMaxSeq.get(dialogId) != null ? knownMaxSeq.get(dialogId) : 0, maxSeq));
             }
+            // isEnd=false: disk cache is a hint; OpenIM REST may still have older/newer pages.
             mc.processLoadedMessages(res, res.messages.size(), dialogId, 0, count, max_id, 0, true, classGuid,
-                    0, last_message_id, 0, 0, load_type, true, mode, 0, loadIndex, false, 0, true, false, null);
+                    0, last_message_id, 0, 0, load_type, false, mode, 0, loadIndex, false, 0, true, false, null);
             FileLog.d("kgram cache restore conv=" + convID + " n=" + built.size());
         } catch (Throwable t) {
             FileLog.e(t);
