@@ -146,7 +146,7 @@ public final class OpenIMWebSocket {
                     + "&token=" + enc(tok)
                     + "&platformID=" + KgramServerConfig.PLATFORM_ANDROID
                     + "&sdkType=js"
-                    + "&isBackground=false"
+                    + "&isBackground=" + (isAppBackground() ? "true" : "false")
                     + "&isMsgResp=true"
                     + "&operationID=" + enc(op);
             FileLog.d("kgram ws connecting attempt=" + attempt);
@@ -300,6 +300,14 @@ public final class OpenIMWebSocket {
     private boolean isCurrent(WebSocket ws, int attempt) {
         synchronized (lock) {
             return running && socket == ws && generation.get() == attempt;
+        }
+    }
+
+    private static boolean isAppBackground() {
+        try {
+            return !org.telegram.ui.Components.ForegroundDetector.getInstance().isForeground();
+        } catch (Throwable ignore) {
+            return false;
         }
     }
 

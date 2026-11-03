@@ -117,10 +117,16 @@ public final class KgramTgBridge {
         loadDialogsOpenIM(account, 0);
         loadContactsOpenIM(account);
         ensureWebSocket();
+        ensurePushRuntime();
+        AndroidUtilities.runOnUIThread(KgramNotifications::requestPermissionIfNeeded, 800);
     }
 
     public static void clearActivation() {
         try {
+            try {
+                KgramPushService.stop(org.telegram.messenger.ApplicationLoader.applicationContext);
+            } catch (Throwable ignore) {
+            }
             stopWebSocket();
             peerHasReadApplied.clear();
             knownMaxSeq.clear();
@@ -451,7 +457,7 @@ public final class KgramTgBridge {
         final String peer = openImId(dialogId);
         final String token = KgramSession.imToken(ctx);
         final String convID = OpenIMImClient.singleConversationID(me, peer);
-        watchDialogForReadReceipts(dialogId, true);
+        // Watching is owned by ChatActivity onResume/onPause only.
         ensureWebSocket();
         // Ensure friendship so history/send is allowed on OpenIM.
         OpenIMImClient.ensureFriendAsync(me, peer, ignored -> {
@@ -687,7 +693,6 @@ public final class KgramTgBridge {
                         clearPendingMaps(localId, clientMsgID);
                         clearPendingMaps(localId, gotClient);
                         FileLog.d("kgram send skip re-post alreadyPresent seq=" + seq + " client=" + gotClient);
-                        watchDialogForReadReceipts(dialogId, true);
                         ensureWebSocket();
                         loadDialogsOpenIM(account, 0);
                         return;
@@ -703,7 +708,6 @@ public final class KgramTgBridge {
                         local.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
                         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByAck, localId);
                         FileLog.d("kgram send waiting for seq client=" + gotClient);
-                        watchDialogForReadReceipts(dialogId, true);
                         ensureWebSocket();
                         loadDialogsOpenIM(account, 0);
                         return;
@@ -723,7 +727,6 @@ public final class KgramTgBridge {
                     if (clientMsgID != null && !clientMsgID.equals(gotClient)) {
                         clearPendingMaps(localId, clientMsgID);
                     }
-                    watchDialogForReadReceipts(dialogId, true);
                     ensureWebSocket();
                     // Refresh conversation list preview only; do not re-inject full history here.
                     loadDialogsOpenIM(account, 0);
@@ -792,7 +795,8 @@ public final class KgramTgBridge {
             d.unread_count = 0;
         }
         markConversationReadOpenIM(me, peer, maxId, token);
-        watchDialogForReadReceipts(dialogId, true);
+        // Do NOT set watchedDialogs here — ChatActivity onPause calls markDialogAsReadNow
+        // which would re-arm watch=true after Home and suppress system notifications.
         ensureWebSocket();
         return true;
     }
@@ -835,6 +839,19 @@ public final class KgramTgBridge {
             wsStarted = true;
             ws.start(me, token);
         }
+        try {
+            KgramPushService.ensureStarted(ctx);
+        } catch (Throwable ignore) {
+        }
+    }
+
+    /** Called from KgramPushService / activate to (re)bind WS + channels. */
+    public static void ensurePushRuntime() {
+        Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
+        if (!KgramServerConfig.USE_OPENIM_AUTH || ctx == null || !KgramSession.hasSession(ctx)) {
+            return;
+        }
+        ensureWebSocket();
     }
 
     private static void stopWebSocket() {
@@ -1103,8 +1120,16 @@ public final class KgramTgBridge {
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages, dialogId, fresh, false, 0);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_READ_DIALOG_MESSAGE);
-        // System notification shade for inbound messages when chat is not open.
+        // System notification shade for inbound messages when chat is not open / app backgrounded.
         boolean chatOpen = Boolean.TRUE.equals(watchedDialogs.get(dialogId));
+        try {
+            // Home / multi-task: ChatActivity may still be watched until onPause finishes;
+            // if process is backgrounded, always allow shade notify.
+            if (chatOpen && !org.telegram.ui.Components.ForegroundDetector.getInstance().isForeground()) {
+                chatOpen = false;
+            }
+        } catch (Throwable ignore) {
+        }
         if (!chatOpen) {
             String peerTitle = KgramNotifications.resolvePeerTitle(account, dialogId, peer);
             for (MessageObject mo : fresh) {
@@ -1112,6 +1137,7 @@ public final class KgramTgBridge {
                     continue;
                 }
                 String notifPreview = mo.messageOwner.message;
+                FileLog.d("kgram notify attempt dialog=" + dialogId + " mid=" + mo.getId());
                 KgramNotifications.notifyIncoming(account, dialogId, peerTitle, notifPreview, mo.getId());
             }
         } else {

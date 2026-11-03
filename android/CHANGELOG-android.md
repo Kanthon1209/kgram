@@ -1,3 +1,12 @@
+## v0.1.14-sysnotify-fgs-debug
+- Root-cause fix: markDialogAsRead no longer re-arms watchedDialogs after Home (was suppressing shade)
+- KgramPushService FGS (dataSync) keeps OpenIM WS alive in background; quiet keepalive notification
+- Request POST_NOTIFICATIONS on OpenIM session activate; messages channel `kgram_messages_v2` HIGH
+- Background ForegroundDetector bypass so Home'd chat still notifies
+- Verify: Home app → peer sends → system shade; reopen chat cancels
+
+APK: https://github.com/Kanthon1209/kgram/releases/tag/kgram-apk-v0.1.14-sysnotify-fgs-debug
+
 
 ## v0.1.11-auth-ux-debug
 - Phone → password login directly (no 登录/注册 dialog)
