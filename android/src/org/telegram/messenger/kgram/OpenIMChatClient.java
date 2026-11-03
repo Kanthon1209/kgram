@@ -315,6 +315,16 @@ public final class OpenIMChatClient {
         }
     }
 
+    private static String firstNonEmpty(String a, String b) {
+        if (a != null && a.length() > 0) {
+            return a;
+        }
+        if (b != null && b.length() > 0) {
+            return b;
+        }
+        return null;
+    }
+
     private static String readAll(InputStream is) throws Exception {
         BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
