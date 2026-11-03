@@ -1,0 +1,7 @@
+<!-- Add under <application> near NotificationsService -->
+        <service
+            android:name="org.telegram.messenger.kgram.KgramPushService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+        />
