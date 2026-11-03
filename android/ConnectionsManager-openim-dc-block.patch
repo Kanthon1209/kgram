@@ -1,0 +1,91 @@
+# Excerpt of current kgram TG-DC block hooks in ConnectionsManager.java
+
+@@ lines 29-37 @@
+import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.BaseController;
+import org.telegram.messenger.BuildVars;
+import org.telegram.messenger.kgram.KgramServerConfig;
+import org.telegram.messenger.CaptchaController;
+import org.telegram.messenger.EmuDetector;
+import org.telegram.messenger.FileLoadOperation;
+import org.telegram.messenger.FileLoader;
+
+@@ lines 195-204 @@
+    private static int lastClassGuid = 1;
+    
+
+    /** kgram: when OpenIM auth is on, never talk to Telegram official DCs. */
+    private static boolean kgramBlocksTelegramDc() {
+        return KgramServerConfig.USE_OPENIM_AUTH;
+    }
+
+    private static final ConnectionsManager[] Instance = new ConnectionsManager[UserConfig.MAX_ACCOUNT_COUNT];
+    public static ConnectionsManager getInstance(int num) {
+
+@@ lines 402-418 @@
+        return requestToken;
+    }
+
+    private void sendRequestInternal(TLObject object, RequestDelegate onComplete, RequestDelegateTimestamp onCompleteTimestamp, QuickAckDelegate onQuickAck, WriteToSocketDelegate onWriteToSocket, int flags, int datacenterId, int connectionType, boolean immediate, int requestToken) {
+        if (kgramBlocksTelegramDc()) {
+            if (BuildVars.LOGS_ENABLED) {
+                FileLog.d("kgram: drop MTProto request (OpenIM-only) " + object + " token=" + requestToken);
+            }
+            if (onComplete != null || onCompleteTimestamp != null) {
+                Utilities.stageQueue.postRunnable(() -> {
+                    TLRPC.TL_error error = new TLRPC.TL_error();
+                    error.code = -1000;
+                    error.text = "KGRAM_OPENIM_ONLY";
+                    if (onComplete != null) {
+                        onComplete.run(null, error);
+                    } else {
+                        onCompleteTimestamp.run(null, error, 0);
+
+@@ lines 657-667 @@
+        native_setUserId(currentAccount, id);
+    }
+
+    public void checkConnection() {
+        if (kgramBlocksTelegramDc()) {
+            if (BuildVars.LOGS_ENABLED) {
+                FileLog.d("kgram: skip TG DC checkConnection / mark network unavailable");
+            }
+            try {
+                native_setNetworkAvailable(currentAccount, false, ApplicationLoader.getCurrentNetworkType(), true);
+                native_pauseNetwork(currentAccount);
+
+@@ lines 724-734 @@
+            packageId = "";
+        }
+
+        // OpenIM-only: still init native structures for TG UI, but report offline so DCs are not dialed.
+        boolean networkOnlineForInit = kgramBlocksTelegramDc() ? false : ApplicationLoader.isNetworkOnline();
+        native_init(currentAccount, version, layer, apiId, deviceModel, systemVersion, appVersion, langCode, systemLangCode, configPath, logPath, regId, cFingerprint, installer, packageId, timezoneOffset, userId, userPremium, enablePushConnection, networkOnlineForInit, ApplicationLoader.getCurrentNetworkType(), SharedConfig.measureDevicePerformanceClass());
+        if (kgramBlocksTelegramDc()) {
+            try {
+                native_setNetworkAvailable(currentAccount, false, ApplicationLoader.getCurrentNetworkType(), true);
+                native_pauseNetwork(currentAccount);
+            } catch (Throwable ignore) {
+
+@@ lines 779-787 @@
+        return native_isTestBackend(currentAccount) != 0;
+    }
+
+    public void resumeNetworkMaybe() {
+        if (kgramBlocksTelegramDc()) {
+            return;
+        }
+        native_resumeNetwork(currentAccount, true);
+    }
+
+@@ lines 847-855 @@
+            if (lastPauseTime != 0 && System.currentTimeMillis() - lastPauseTime > 5000) {
+                getContactsController().checkContacts();
+            }
+            lastPauseTime = 0;
+            if (kgramBlocksTelegramDc()) {
+                try {
+                    native_pauseNetwork(currentAccount);
+                } catch (Throwable ignore) {
+                }

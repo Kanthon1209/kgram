@@ -8,7 +8,10 @@ package org.telegram.messenger.kgram;
 public final class KgramServerConfig {
     private KgramServerConfig() {}
 
-    /** When true, LoginActivity PhoneView skips MTProto sendCode and uses OpenIM Chat. */
+    /**
+     * When true: LoginActivity uses OpenIM Chat only; ConnectionsManager drops MTProto
+     * requests and keeps TG DCs paused (no official Telegram network / API id flood).
+     */
     public static final boolean USE_OPENIM_AUTH = true;
 
     public static final String CHAT_API = "http://8.136.150.149:10008";

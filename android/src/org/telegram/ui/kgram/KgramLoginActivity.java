@@ -31,7 +31,7 @@ import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RadialProgressView;
 
 /**
- * Separate OpenIM login screen: account (phone) + password.
+ * OpenIM login: phone (from previous page) + password. Register is secondary.
  */
 public class KgramLoginActivity extends FragmentActivity {
 
@@ -41,6 +41,7 @@ public class KgramLoginActivity extends FragmentActivity {
     private String areaCode;
     private String phone;
     private EditTextBoldCursor passField;
+    private TextView errorView;
     private RadialProgressView progressView;
     private TextView nextBtn;
     private boolean busy;
@@ -119,6 +120,13 @@ public class KgramLoginActivity extends FragmentActivity {
         });
         content.addView(passField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 6, 0, 0));
 
+        errorView = new TextView(this);
+        errorView.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
+        errorView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+        errorView.setVisibility(android.view.View.GONE);
+        errorView.setPadding(0, AndroidUtilities.dp(8), 0, 0);
+        content.addView(errorView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
         nextBtn = new TextView(this);
         nextBtn.setText("登录");
         nextBtn.setGravity(Gravity.CENTER);
@@ -137,13 +145,7 @@ public class KgramLoginActivity extends FragmentActivity {
         goRegister.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText2));
         goRegister.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
         goRegister.setPadding(0, AndroidUtilities.dp(18), 0, 0);
-        goRegister.setOnClickListener(v -> {
-            Intent i = new Intent(this, KgramRegisterActivity.class);
-            i.putExtra(KgramRegisterActivity.EXTRA_AREA, areaCode);
-            i.putExtra(KgramRegisterActivity.EXTRA_PHONE, phone);
-            startActivity(i);
-            finish();
-        });
+        goRegister.setOnClickListener(v -> openRegister());
         content.addView(goRegister, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
         scroll.addView(content);
@@ -159,6 +161,14 @@ public class KgramLoginActivity extends FragmentActivity {
             passField.requestFocus();
             AndroidUtilities.showKeyboard(passField);
         }, 200);
+    }
+
+    private void openRegister() {
+        Intent i = new Intent(this, KgramRegisterActivity.class);
+        i.putExtra(KgramRegisterActivity.EXTRA_AREA, areaCode);
+        i.putExtra(KgramRegisterActivity.EXTRA_PHONE, phone);
+        startActivity(i);
+        finish();
     }
 
     private TextView label(String t) {
@@ -189,28 +199,63 @@ public class KgramLoginActivity extends FragmentActivity {
         return e;
     }
 
+    private void clearError() {
+        if (errorView != null) {
+            errorView.setVisibility(android.view.View.GONE);
+            errorView.setText("");
+        }
+    }
+
+    private void showFieldError(String msg) {
+        if (errorView != null) {
+            errorView.setText(msg);
+            errorView.setVisibility(android.view.View.VISIBLE);
+        }
+    }
+
+    private String resolveNickname(OpenIMChatClient.Result result) {
+        if (result != null && !TextUtils.isEmpty(result.nickname)) {
+            return result.nickname.trim();
+        }
+        String existing = KgramSession.nickname(this);
+        if (!TextUtils.isEmpty(existing) && !existing.equals(KgramSession.userID(this))) {
+            // keep a previously saved real nick when API did not return one
+            if (!existing.startsWith("kgram_") || !existing.equals("kgram_" + phone)) {
+                return existing;
+            }
+            // even phone-based fallback from prior session is better than inventing a new fake label
+            return existing;
+        }
+        // Local display fallback only — not presented as a server-fetched nick.
+        return "kgram_" + phone;
+    }
+
     private void doLogin() {
         if (busy) {
             return;
         }
+        clearError();
         String password = passField.getText() != null ? passField.getText().toString() : "";
         if (password.length() < 6) {
-            alert("提示", "密码至少 6 位");
+            showFieldError("密码至少 6 位");
             return;
         }
         busy = true;
         progressView.setVisibility(android.view.View.VISIBLE);
         nextBtn.setEnabled(false);
+        nextBtn.setAlpha(0.5f);
         OpenIMChatClient.loginAsync(areaCode, phone, password, result -> AndroidUtilities.runOnUIThread(() -> {
             busy = false;
             progressView.setVisibility(android.view.View.GONE);
             nextBtn.setEnabled(true);
+            nextBtn.setAlpha(1f);
             if (result.ok()) {
                 if (TextUtils.isEmpty(result.userID) || TextUtils.isEmpty(result.imToken)) {
                     alert("登录异常", "服务器未返回 userID / imToken");
                     return;
                 }
-                KgramSession.save(this, areaCode, phone, "kgram_" + phone, result.userID, result.imToken, result.chatToken);
+                String nick = resolveNickname(result);
+                KgramSession.save(this, areaCode, phone, nick, result.userID, result.imToken, result.chatToken);
                 KgramTgBridge.activateFromSession(this);
                 Intent i = new Intent(this, LaunchActivity.class);
                 i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK | Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -219,9 +264,14 @@ public class KgramLoginActivity extends FragmentActivity {
                 return;
             }
             if (result.accountNotFound()) {
-                alert("尚未注册", "该手机号还没有账号，请先注册。");
+                new AlertDialog.Builder(this)
+                        .setTitle("尚未注册")
+                        .setMessage("该手机号还没有账号。")
+                        .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                        .setPositiveButton("去注册", (d, w) -> openRegister())
+                        .show();
             } else {
-                alert("登录失败", OpenIMChatClient.friendlyMessage(result));
+                showFieldError(OpenIMChatClient.friendlyMessage(result));
             }
         }));
     }

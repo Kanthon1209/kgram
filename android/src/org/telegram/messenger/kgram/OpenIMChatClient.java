@@ -41,15 +41,22 @@ public final class OpenIMChatClient {
         public final String userID;
         public final String imToken;
         public final String chatToken;
+        /** Optional nickname from Chat login/register payload when present. */
+        public final String nickname;
         public final String raw;
 
         public Result(int errCode, String errMsg, String errDlt, String userID, String imToken, String chatToken, String raw) {
+            this(errCode, errMsg, errDlt, userID, imToken, chatToken, null, raw);
+        }
+
+        public Result(int errCode, String errMsg, String errDlt, String userID, String imToken, String chatToken, String nickname, String raw) {
             this.errCode = errCode;
             this.errMsg = errMsg != null ? errMsg : "";
             this.errDlt = errDlt != null ? errDlt : "";
             this.userID = userID;
             this.imToken = imToken;
             this.chatToken = chatToken;
+            this.nickname = nickname;
             this.raw = raw;
         }
 
@@ -105,7 +112,7 @@ public final class OpenIMChatClient {
             case ERR_PASSWORD:
                 return "密码错误，请重试";
             case ERR_ACCOUNT_NOT_FOUND:
-                return "该手机号尚未注册，请先点「注册」";
+                return "该手机号尚未注册";
             case ERR_ALREADY_REGISTERED:
                 return "该手机号已注册，请改用「登录」";
             case ERR_VERIFY_CODE:
@@ -264,6 +271,7 @@ public final class OpenIMChatClient {
             String userID = null;
             String imToken = null;
             String chatToken = null;
+            String nickname = null;
             if (root.has("data") && !root.isNull("data")) {
                 JSONObject data = root.getJSONObject("data");
                 userID = data.optString("userID", null);
@@ -278,8 +286,28 @@ public final class OpenIMChatClient {
                 if (chatToken != null && chatToken.length() == 0) {
                     chatToken = null;
                 }
+                nickname = firstNonEmpty(
+                        data.optString("nickname", null),
+                        data.optString("nickName", null));
+                if ((nickname == null || nickname.length() == 0) && data.has("user") && !data.isNull("user")) {
+                    JSONObject user = data.optJSONObject("user");
+                    if (user != null) {
+                        nickname = firstNonEmpty(
+                                user.optString("nickname", null),
+                                user.optString("nickName", null));
+                        if (userID == null || userID.length() == 0) {
+                            String uid = user.optString("userID", null);
+                            if (uid != null && uid.length() > 0) {
+                                userID = uid;
+                            }
+                        }
+                    }
+                }
+                if (nickname != null && nickname.length() == 0) {
+                    nickname = null;
+                }
             }
-            return new Result(errCode, errMsg, errDlt, userID, imToken, chatToken, raw);
+            return new Result(errCode, errMsg, errDlt, userID, imToken, chatToken, nickname, raw);
         } finally {
             if (conn != null) {
                 conn.disconnect();

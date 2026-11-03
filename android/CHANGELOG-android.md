@@ -1,3 +1,9 @@
+
+## v0.1.11-auth-ux-debug
+- Phone → password login directly (no 登录/注册 dialog)
+- Register secondary; clearer CTAs for accountNotFound / alreadyRegistered
+- ConnectionsManager blocks Telegram official DC traffic when USE_OPENIM_AUTH
+- Parse nickname from OpenIM login/register when present
 # Android adapter changelog
 
 ## v0.1.10

@@ -32,7 +32,7 @@ import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RadialProgressView;
 
 /**
- * Separate OpenIM register screen: phone + verify code + nickname + password.
+ * OpenIM register: verify code + nickname + password. Login is one tap away.
  */
 public class KgramRegisterActivity extends FragmentActivity {
 
@@ -45,6 +45,7 @@ public class KgramRegisterActivity extends FragmentActivity {
     private EditTextBoldCursor nickField;
     private EditTextBoldCursor passField;
     private EditTextBoldCursor pass2Field;
+    private TextView errorView;
     private RadialProgressView progressView;
     private TextView nextBtn;
     private boolean busy;
@@ -83,7 +84,8 @@ public class KgramRegisterActivity extends FragmentActivity {
             @Override
             public void onItemClick(int id) {
                 if (id == -1) {
-                    finish();
+                    // Prefer login page over stacking; back returns to phone page via login.
+                    openLogin();
                 }
             }
         });
@@ -110,10 +112,17 @@ public class KgramRegisterActivity extends FragmentActivity {
 
         content.addView(label("验证码"), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         codeField = field(false);
-        codeField.setHint("演示默认 " + KgramServerConfig.SUPER_VERIFY_CODE);
+        codeField.setHint("默认 " + KgramServerConfig.SUPER_VERIFY_CODE);
         codeField.setText(KgramServerConfig.SUPER_VERIFY_CODE);
         codeField.setInputType(InputType.TYPE_CLASS_NUMBER);
-        content.addView(codeField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 6, 0, 12));
+        content.addView(codeField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 6, 0, 4));
+
+        TextView codeHint = new TextView(this);
+        codeHint.setText("演示环境已预填验证码，可直接下一步。");
+        codeHint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12);
+        codeHint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
+        codeHint.setPadding(0, 0, 0, AndroidUtilities.dp(12));
+        content.addView(codeHint, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
         content.addView(label("昵称"), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         nickField = field(false);
@@ -139,6 +148,13 @@ public class KgramRegisterActivity extends FragmentActivity {
         });
         content.addView(pass2Field, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 6, 0, 0));
 
+        errorView = new TextView(this);
+        errorView.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
+        errorView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+        errorView.setVisibility(android.view.View.GONE);
+        errorView.setPadding(0, AndroidUtilities.dp(8), 0, 0);
+        content.addView(errorView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
         nextBtn = new TextView(this);
         nextBtn.setText("注册并进入");
         nextBtn.setGravity(Gravity.CENTER);
@@ -157,13 +173,7 @@ public class KgramRegisterActivity extends FragmentActivity {
         goLogin.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText2));
         goLogin.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
         goLogin.setPadding(0, AndroidUtilities.dp(18), 0, 0);
-        goLogin.setOnClickListener(v -> {
-            Intent i = new Intent(this, KgramLoginActivity.class);
-            i.putExtra(KgramLoginActivity.EXTRA_AREA, areaCode);
-            i.putExtra(KgramLoginActivity.EXTRA_PHONE, phone);
-            startActivity(i);
-            finish();
-        });
+        goLogin.setOnClickListener(v -> openLogin());
         content.addView(goLogin, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
         scroll.addView(content);
@@ -175,6 +185,14 @@ public class KgramRegisterActivity extends FragmentActivity {
         root.addView(progressView, LayoutHelper.createFrame(40, 40, Gravity.CENTER));
 
         setContentView(root);
+    }
+
+    private void openLogin() {
+        Intent i = new Intent(this, KgramLoginActivity.class);
+        i.putExtra(KgramLoginActivity.EXTRA_AREA, areaCode);
+        i.putExtra(KgramLoginActivity.EXTRA_PHONE, phone);
+        startActivity(i);
+        finish();
     }
 
     private TextView label(String t) {
@@ -207,33 +225,49 @@ public class KgramRegisterActivity extends FragmentActivity {
         return e;
     }
 
+    private void clearError() {
+        if (errorView != null) {
+            errorView.setVisibility(android.view.View.GONE);
+            errorView.setText("");
+        }
+    }
+
+    private void showFieldError(String msg) {
+        if (errorView != null) {
+            errorView.setText(msg);
+            errorView.setVisibility(android.view.View.VISIBLE);
+        }
+    }
+
     private void doRegister() {
         if (busy) {
             return;
         }
+        clearError();
         String code = codeField.getText() != null ? codeField.getText().toString().trim() : "";
         String nick = nickField.getText() != null ? nickField.getText().toString().trim() : "";
         String password = passField.getText() != null ? passField.getText().toString() : "";
         String password2 = pass2Field.getText() != null ? pass2Field.getText().toString() : "";
         if (!KgramServerConfig.SUPER_VERIFY_CODE.equals(code)) {
-            alert("验证码错误", "演示环境请使用 " + KgramServerConfig.SUPER_VERIFY_CODE);
+            showFieldError("验证码不正确（演示默认 " + KgramServerConfig.SUPER_VERIFY_CODE + "）");
             return;
         }
         if (nick.length() == 0) {
-            alert("提示", "请填写昵称");
+            showFieldError("请填写昵称");
             return;
         }
         if (password.length() < 6) {
-            alert("提示", "密码至少 6 位");
+            showFieldError("密码至少 6 位");
             return;
         }
         if (!password.equals(password2)) {
-            alert("提示", "两次密码不一致");
+            showFieldError("两次密码不一致");
             return;
         }
         busy = true;
         progressView.setVisibility(android.view.View.VISIBLE);
         nextBtn.setEnabled(false);
+        nextBtn.setAlpha(0.5f);
         OpenIMChatClient.registerAsync(areaCode, phone, password, nick, result -> AndroidUtilities.runOnUIThread(() -> {
             if (result.ok()) {
                 finishAuth(nick, result);
@@ -243,16 +277,23 @@ public class KgramRegisterActivity extends FragmentActivity {
                 // already registered → try login with same password
                 OpenIMChatClient.loginAsync(areaCode, phone, password, result2 -> AndroidUtilities.runOnUIThread(() -> {
                     if (result2.ok()) {
-                        finishAuth(nick, result2);
+                        String useNick = !TextUtils.isEmpty(result2.nickname) ? result2.nickname : nick;
+                        finishAuth(useNick, result2);
                         return;
                     }
                     busy = false;
                     progressView.setVisibility(android.view.View.GONE);
                     nextBtn.setEnabled(true);
+                    nextBtn.setAlpha(1f);
                     if (result2.passwordError()) {
-                        alert("账号已注册", "该手机号已注册，但密码不正确。请改用登录页。");
+                        new AlertDialog.Builder(this)
+                                .setTitle("账号已注册")
+                                .setMessage("该手机号已有账号，但密码不正确。")
+                                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                                .setPositiveButton("去登录", (d, w) -> openLogin())
+                                .show();
                     } else {
-                        alert("注册失败", OpenIMChatClient.friendlyMessage(result2));
+                        showFieldError(OpenIMChatClient.friendlyMessage(result2));
                     }
                 }));
                 return;
@@ -260,7 +301,8 @@ public class KgramRegisterActivity extends FragmentActivity {
             busy = false;
             progressView.setVisibility(android.view.View.GONE);
             nextBtn.setEnabled(true);
-            alert("注册失败", OpenIMChatClient.friendlyMessage(result));
+            nextBtn.setAlpha(1f);
+            showFieldError(OpenIMChatClient.friendlyMessage(result));
         }));
     }
 
@@ -268,11 +310,13 @@ public class KgramRegisterActivity extends FragmentActivity {
         busy = false;
         progressView.setVisibility(android.view.View.GONE);
         nextBtn.setEnabled(true);
+        nextBtn.setAlpha(1f);
         if (TextUtils.isEmpty(result.userID) || TextUtils.isEmpty(result.imToken)) {
             alert("注册异常", "服务器未返回 userID / imToken");
             return;
         }
-        KgramSession.save(this, areaCode, phone, nick, result.userID, result.imToken, result.chatToken);
+        String saveNick = !TextUtils.isEmpty(result.nickname) ? result.nickname : nick;
+        KgramSession.save(this, areaCode, phone, saveNick, result.userID, result.imToken, result.chatToken);
         KgramTgBridge.activateFromSession(this);
         Intent i = new Intent(this, LaunchActivity.class);
         i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK | Intent.FLAG_ACTIVITY_NEW_TASK);
