@@ -607,12 +607,11 @@ public final class KgramTgBridge {
                 OpenIMImClient.sendTextAsync(me, peer, nick, textMsg, clientMsgID, result -> AndroidUtilities.runOnUIThread(() -> {
                     MessagesController mc = MessagesController.getInstance(account);
                     if (!result.ok()) {
-                        dropPendingLocal(account, localId, clientMsgID);
+                        // Keep the same bubble; flip to error in-place (no delete+re-add pop).
+                        clearPendingMaps(localId, clientMsgID);
                         FileLog.e("kgram send fail " + result.errCode + " " + result.errMsg + " " + result.errDlt);
                         local.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
-                        ArrayList<MessageObject> errArr = new ArrayList<>();
-                        errArr.add(new MessageObject(account, local, true, false));
-                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages, dialogId, errArr, false, 0);
+                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageSendError, localId);
                         return;
                     }
 
@@ -664,18 +663,22 @@ public final class KgramTgBridge {
                         knownMaxSeq.put(dialogId, Math.max(seq, prevMax != null ? prevMax : 0));
                     }
 
-                    // Always drop optimistic bubble; WS/history may already own the canonical copy.
-                    dropPendingLocal(account, localId, gotClient);
-                    // Also drop under the original pending mapping if client id changed.
-                    dropPendingLocal(account, localId, clientMsgID);
-
                     // Outbox checkmarks only follow real peer hasReadSeq receipts.
                     Integer applied = peerHasReadApplied.get(dialogId);
                     int keepOut = applied != null ? applied : 0;
                     mc.dialogs_read_outbox_max.put(dialogId, keepOut);
 
                     if (alreadyPresent) {
-                        // WS (or earlier inject) already showed this outgoing message.
+                        // WS/history already owns the canonical bubble — remove orphan optimistic only.
+                        Integer still = pendingClientLocalId.get(gotClient);
+                        if (still == null && clientMsgID != null && !clientMsgID.equals(gotClient)) {
+                            still = pendingClientLocalId.get(clientMsgID);
+                        }
+                        if (still != null) {
+                            dropPendingLocal(account, still, gotClient);
+                        }
+                        clearPendingMaps(localId, clientMsgID);
+                        clearPendingMaps(localId, gotClient);
                         FileLog.d("kgram send skip re-post alreadyPresent seq=" + seq + " client=" + gotClient);
                         watchDialogForReadReceipts(dialogId, true);
                         ensureWebSocket();
@@ -684,18 +687,14 @@ public final class KgramTgBridge {
                     }
 
                     if (seq <= 0) {
-                        // No server seq yet — keep UI quiet; WS push will inject the canonical bubble.
-                        // Re-show a non-sending local only if nothing else is present.
-                        TLRPC.TL_message waiting = buildMessage(me, peer, textMsg, sendTime, localId, true, false, true);
-                        waiting.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
-                        // Re-bind pending so WS can replace this local by clientMsgID.
+                        // No server seq yet — keep the same bubble; mark sent; WS will promote by clientMsgID.
                         pendingLocalClientMsg.put(localId, gotClient);
                         pendingClientLocalId.put(gotClient, localId);
-                        MessageObject waitMo = new MessageObject(account, waiting, true, false);
-                        ArrayList<MessageObject> waitArr = new ArrayList<>();
-                        waitArr.add(waitMo);
-                        mc.dialogMessage.put(dialogId, waitArr);
-                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages, dialogId, waitArr, false, 0);
+                        if (clientMsgID != null && !clientMsgID.equals(gotClient)) {
+                            pendingClientLocalId.remove(clientMsgID);
+                        }
+                        local.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
+                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByAck, localId);
                         FileLog.d("kgram send waiting for seq client=" + gotClient);
                         watchDialogForReadReceipts(dialogId, true);
                         ensureWebSocket();
@@ -707,19 +706,18 @@ public final class KgramTgBridge {
                     TLRPC.TL_message sent = buildMessage(me, peer, textMsg, sendTime, serverId, true, false, true);
                     sent.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
                     sent.unread = serverId > keepOut;
-                    MessageObject sentMo = new MessageObject(account, sent, true, false);
-                    ArrayList<MessageObject> sentArr = new ArrayList<>();
-                    sentArr.add(sentMo);
-                    mc.dialogMessage.put(dialogId, sentArr);
                     TLRPC.Dialog d = mc.dialogs_dict.get(dialogId);
                     if (d != null) {
-                        d.top_message = Math.max(d.top_message, serverId);
-                        d.last_message_date = sent.date;
                         d.read_outbox_max_id = keepOut;
+                        d.last_message_date = sent.date;
+                    }
+                    // In-place localId → serverId (no messagesDeleted + didReceiveNewMessages double pop).
+                    promotePendingToServer(account, dialogId, localId, gotClient, sent, serverId);
+                    if (clientMsgID != null && !clientMsgID.equals(gotClient)) {
+                        clearPendingMaps(localId, clientMsgID);
                     }
                     watchDialogForReadReceipts(dialogId, true);
                     ensureWebSocket();
-                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages, dialogId, sentArr, false, 0);
                     // Refresh conversation list preview only; do not re-inject full history here.
                     loadDialogsOpenIM(account, 0);
                 }));
@@ -963,12 +961,9 @@ public final class KgramTgBridge {
             String clientId = m.clientMsgID;
             String serverId = m.serverMsgID;
 
-            // Drop optimistic bubble for this clientMsgID even if we skip re-post.
+            Integer loc = null;
             if (clientId != null && clientId.length() > 0) {
-                Integer loc = pendingClientLocalId.get(clientId);
-                if (loc != null) {
-                    dropPendingLocal(account, loc, clientId);
-                }
+                loc = pendingClientLocalId.get(clientId);
             }
 
             boolean already = isMessageKnown(dialogId, seq, clientId, serverId);
@@ -978,6 +973,36 @@ public final class KgramTgBridge {
                 }
                 // Bind any new seq/client/server aliases together.
                 noteMessageKeys(dialogId, seq, clientId, serverId);
+                // Canonical already known: promote or drop leftover optimistic (never re-add).
+                if (loc != null) {
+                    if (seq > 0) {
+                        int id = (int) Math.min(seq, Integer.MAX_VALUE);
+                        boolean out = me.equals(m.sendID);
+                        boolean outUnread = out && id > peerHas;
+                        TLRPC.TL_message msg = buildMessage(me, peer, m.text, m.sendTime, id, out, false, outUnread);
+                        promotePendingToServer(account, dialogId, loc, clientId, msg, id);
+                    } else {
+                        dropPendingLocal(account, loc, clientId);
+                    }
+                }
+                continue;
+            }
+
+            // Pending optimistic for this clientMsgID → in-place localId→seq upgrade (one bubble).
+            if (loc != null && seq > 0) {
+                noteMessageKeys(dialogId, seq, clientId, serverId);
+                int id = (int) Math.min(seq, Integer.MAX_VALUE);
+                boolean out = me.equals(m.sendID);
+                boolean outUnread = out && id > peerHas;
+                TLRPC.TL_message msg = buildMessage(me, peer, m.text, m.sendTime, id, out, false, outUnread);
+                promotePendingToServer(account, dialogId, loc, clientId, msg, id);
+                if (seq > newMax) {
+                    newMax = seq;
+                }
+                continue;
+            }
+            if (loc != null) {
+                // No seq yet — leave the optimistic bubble alone.
                 continue;
             }
 
@@ -1114,7 +1139,7 @@ public final class KgramTgBridge {
         return already;
     }
 
-    private static void dropPendingLocal(int account, int localId, String clientMsgID) {
+    private static void clearPendingMaps(int localId, String clientMsgID) {
         if (clientMsgID != null && clientMsgID.length() > 0) {
             pendingClientLocalId.remove(clientMsgID);
         }
@@ -1122,10 +1147,39 @@ public final class KgramTgBridge {
         if (mapped != null) {
             pendingClientLocalId.remove(mapped);
         }
+    }
+
+    private static void dropPendingLocal(int account, int localId, String clientMsgID) {
+        clearPendingMaps(localId, clientMsgID);
         ArrayList<Integer> del = new ArrayList<>();
         del.add(localId);
         NotificationCenter.getInstance(account).postNotificationName(
                 NotificationCenter.messagesDeleted, del, 0L, false, false, false, 0);
+    }
+
+    /**
+     * Upgrade an optimistic local bubble to the server seq/id in-place via TG's native
+     * messageReceivedByServer path (row update, not remove+insert animation).
+     */
+    private static void promotePendingToServer(int account, long dialogId, int localId, String clientMsgID,
+                                               TLRPC.Message sentMsg, int serverId) {
+        clearPendingMaps(localId, clientMsgID);
+        if (sentMsg == null) {
+            return;
+        }
+        sentMsg.id = serverId;
+        sentMsg.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
+        MessagesController mc = MessagesController.getInstance(account);
+        ArrayList<MessageObject> preview = new ArrayList<>();
+        preview.add(new MessageObject(account, sentMsg, true, false));
+        mc.dialogMessage.put(dialogId, preview);
+        NotificationCenter nc = NotificationCenter.getInstance(account);
+        nc.postNotificationName(NotificationCenter.messageReceivedByServer,
+                localId, serverId, sentMsg, dialogId, 0L, 0, false);
+        nc.postNotificationName(NotificationCenter.messageReceivedByServer2,
+                localId, serverId, sentMsg, dialogId, 0L, 0, false);
+        FileLog.d("kgram promote local=" + localId + " -> server=" + serverId + " dialog=" + dialogId
+                + " client=" + clientMsgID);
     }
 
     /** Apply peer hasReadSeq as TG read_outbox_max (double-check for id <= peerHas). */
