@@ -1,6 +1,7 @@
 package org.telegram.messenger.kgram;
 
 import android.content.Context;
+import android.util.Log;
 import android.text.TextUtils;
 
 import org.json.JSONObject;
@@ -14,6 +15,7 @@ import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.SendMessagesHelper;
 import org.telegram.messenger.UserConfig;
+import org.telegram.ui.Components.ForegroundDetector;
 import org.telegram.tgnet.TLRPC;
 
 import java.util.ArrayList;
@@ -47,6 +49,8 @@ public final class KgramTgBridge {
     /** dialogIds currently open in ChatActivity (inbox auto-read). */
     private static final ConcurrentHashMap<Long, Boolean> watchedDialogs = new ConcurrentHashMap<>();
     private static boolean wsStarted = false;
+    private static volatile boolean fgListenerRegistered = false;
+    private static final String NOTIFY_TAG = "kgram-notify";
     private static final OpenIMWebSocket.Listener wsListener = new OpenIMWebSocket.Listener() {
         @Override
         public void onPushMessages(OpenIMProtoLite.DecodedPush push) {
@@ -811,6 +815,20 @@ public final class KgramTgBridge {
         }
         final int account = UserConfig.selectedAccount;
         if (watch) {
+            // Never mark as open while process is backgrounded (Home race).
+            boolean fg = true;
+            try {
+                ForegroundDetector det = ForegroundDetector.getInstance();
+                if (det != null) {
+                    fg = det.isForeground();
+                }
+            } catch (Throwable ignore) {
+            }
+            if (!fg) {
+                Log.e(NOTIFY_TAG, "ignore watch=true while background dialog=" + dialogId);
+                watchedDialogs.remove(dialogId);
+                return;
+            }
             watchedDialogs.put(dialogId, Boolean.TRUE);
             try {
                 org.telegram.messenger.NotificationsController.getInstance(account).setOpenedDialogId(dialogId, 0);
@@ -823,6 +841,58 @@ public final class KgramTgBridge {
                 org.telegram.messenger.NotificationsController.getInstance(account).setOpenedDialogId(0, 0);
             } catch (Throwable ignore) {
             }
+        }
+    }
+
+    /** Clear all open-chat watches — called when app goes to background. */
+    public static void clearWatchedDialogsForBackground() {
+        if (!watchedDialogs.isEmpty()) {
+            Log.e(NOTIFY_TAG, "clear watchedDialogs on background size=" + watchedDialogs.size());
+        }
+        watchedDialogs.clear();
+        try {
+            org.telegram.messenger.NotificationsController.getInstance(UserConfig.selectedAccount)
+                    .setOpenedDialogId(0, 0);
+        } catch (Throwable ignore) {
+        }
+    }
+
+    private static void registerForegroundListenerOnce() {
+        if (fgListenerRegistered) {
+            return;
+        }
+        try {
+            ForegroundDetector det = ForegroundDetector.getInstance();
+            if (det == null) {
+                return;
+            }
+            fgListenerRegistered = true;
+            det.addListener(new ForegroundDetector.Listener() {
+                @Override
+                public void onBecameForeground() {
+                    Log.e(NOTIFY_TAG, "app foreground");
+                    AndroidUtilities.runOnUIThread(KgramNotifications::requestPermissionIfNeeded, 400);
+                    try {
+                        KgramPushService.ensureStarted(org.telegram.messenger.ApplicationLoader.applicationContext);
+                    } catch (Throwable ignore) {
+                    }
+                }
+
+                @Override
+                public void onBecameBackground() {
+                    Log.e(NOTIFY_TAG, "app background — clear watches + ensure FGS");
+                    clearWatchedDialogsForBackground();
+                    try {
+                        KgramPushService.ensureStarted(org.telegram.messenger.ApplicationLoader.applicationContext);
+                    } catch (Throwable ignore) {
+                    }
+                    ensureWebSocket();
+                }
+            });
+            Log.e(NOTIFY_TAG, "ForegroundDetector listener registered");
+        } catch (Throwable t) {
+            Log.e(NOTIFY_TAG, "registerForegroundListener failed", t);
+            FileLog.e(t);
         }
     }
 
@@ -839,9 +909,11 @@ public final class KgramTgBridge {
         String token = KgramSession.imToken(ctx);
         OpenIMWebSocket ws = OpenIMWebSocket.getInstance();
         ws.setListener(wsListener);
-        if (!wsStarted || !ws.isRunning()) {
+        if (!wsStarted || !ws.isRunning() || !ws.isConnected()) {
             wsStarted = true;
             ws.start(me, token);
+            android.util.Log.e(NOTIFY_TAG, "ensureWebSocket start/reconnect running="
+                    + ws.isRunning() + " connected=" + ws.isConnected());
         }
         try {
             KgramPushService.ensureStarted(ctx);
@@ -855,7 +927,14 @@ public final class KgramTgBridge {
         if (!KgramServerConfig.USE_OPENIM_AUTH || ctx == null || !KgramSession.hasSession(ctx)) {
             return;
         }
+        registerForegroundListenerOnce();
         ensureWebSocket();
+        AndroidUtilities.runOnUIThread(KgramNotifications::requestPermissionIfNeeded, 300);
+        try {
+            KgramNotifications.ensureChannel(ctx);
+            KgramNotifications.dumpState(ctx);
+        } catch (Throwable ignore) {
+        }
     }
 
     private static void stopWebSocket() {
@@ -1125,24 +1204,46 @@ public final class KgramTgBridge {
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_READ_DIALOG_MESSAGE);
         // System notification shade for inbound messages when chat is not open / app backgrounded.
-        boolean chatOpen = Boolean.TRUE.equals(watchedDialogs.get(dialogId));
+        boolean appForeground = true;
         try {
-            // Home / multi-task: ChatActivity may still be watched until onPause finishes;
-            // if process is backgrounded, always allow shade notify.
-            if (chatOpen && !org.telegram.ui.Components.ForegroundDetector.getInstance().isForeground()) {
-                chatOpen = false;
+            ForegroundDetector det = ForegroundDetector.getInstance();
+            if (det != null) {
+                appForeground = det.isForeground();
             }
         } catch (Throwable ignore) {
         }
+        boolean chatOpen = Boolean.TRUE.equals(watchedDialogs.get(dialogId));
+        // Hard rule: backgrounded process ALWAYS notifies (Home / multi-task race).
+        if (!appForeground) {
+            chatOpen = false;
+        }
+        Log.e(NOTIFY_TAG, "inject notify gate dialog=" + dialogId
+                + " fresh=" + fresh.size()
+                + " chatOpen=" + chatOpen
+                + " appFg=" + appForeground
+                + " watched=" + watchedDialogs.containsKey(dialogId));
         if (!chatOpen) {
             String peerTitle = KgramNotifications.resolvePeerTitle(account, dialogId, peer);
+            ArrayList<MessageObject> inbound = new ArrayList<>();
             for (MessageObject mo : fresh) {
                 if (mo == null || mo.isOut() || mo.messageOwner == null) {
                     continue;
                 }
+                inbound.add(mo);
                 String notifPreview = mo.messageOwner.message;
-                FileLog.d("kgram notify attempt dialog=" + dialogId + " mid=" + mo.getId());
+                Log.e(NOTIFY_TAG, "notify attempt dialog=" + dialogId + " mid=" + mo.getId());
+                FileLog.e("kgram notify attempt dialog=" + dialogId + " mid=" + mo.getId());
                 KgramNotifications.notifyIncoming(account, dialogId, peerTitle, notifPreview, mo.getId());
+            }
+            // Dual path: also feed TG NotificationsController (uses its own channels).
+            if (!inbound.isEmpty()) {
+                try {
+                    org.telegram.messenger.NotificationsController.getInstance(account)
+                            .processNewMessages(inbound, true, false, null);
+                } catch (Throwable t) {
+                    Log.e(NOTIFY_TAG, "processNewMessages failed", t);
+                    FileLog.e(t);
+                }
             }
         } else {
             KgramNotifications.cancelDialog(account, dialogId);

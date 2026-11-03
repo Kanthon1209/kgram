@@ -1,6 +1,9 @@
 package org.telegram.messenger.kgram;
 
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.util.Base64;
+import android.util.Log;
 
 import com.neovisionaries.ws.client.WebSocket;
 import com.neovisionaries.ws.client.WebSocketAdapter;
@@ -22,10 +25,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * OpenIM message-gateway WebSocket (sdkType=js JSON envelope).
  * Realtime path for push msgs (2001) and hasReadSeq notifications.
+ * Ping / reconnect run on a dedicated HandlerThread so OEM main-looper
+ * freezes in background cannot kill the keep-alive.
  */
 public final class OpenIMWebSocket {
     public static final int WS_PUSH_MSG = 2001;
     public static final int WS_KICK = 2002;
+    private static final String TAG = "kgram-ws";
 
     public interface Listener {
         void onPushMessages(OpenIMProtoLite.DecodedPush push);
@@ -47,6 +53,10 @@ public final class OpenIMWebSocket {
     private String token;
     private boolean running;
     private int backoffMs = 1000;
+
+    private HandlerThread workerThread;
+    private Handler workerHandler;
+
     private final Runnable reconnectRunnable = this::connectInternal;
     private final Runnable pingRunnable = new Runnable() {
         @Override
@@ -63,9 +73,10 @@ public final class OpenIMWebSocket {
                     ws.sendText("{\"type\":\"ping\"}");
                 }
             } catch (Throwable t) {
+                Log.e(TAG, "ping failed", t);
                 FileLog.e(t);
             }
-            AndroidUtilities.runOnUIThread(this, 15000);
+            postWorker(this, 15000);
         }
     };
 
@@ -77,24 +88,27 @@ public final class OpenIMWebSocket {
 
     public void start(String userID, String imToken) {
         if (userID == null || userID.length() == 0 || imToken == null || imToken.length() == 0) {
+            Log.e(TAG, "start missing creds");
             FileLog.e("kgram ws start missing creds");
             return;
         }
+        ensureWorker();
         synchronized (lock) {
             this.userID = userID;
             this.token = imToken;
             this.running = true;
             this.backoffMs = 1000;
         }
-        AndroidUtilities.cancelRunOnUIThread(reconnectRunnable);
-        connectInternal();
+        cancelWorker(reconnectRunnable);
+        postWorker(this::connectInternal, 0);
+        Log.e(TAG, "start requested uid=" + userID);
     }
 
     public void stop() {
         running = false;
         generation.incrementAndGet();
-        AndroidUtilities.cancelRunOnUIThread(reconnectRunnable);
-        AndroidUtilities.cancelRunOnUIThread(pingRunnable);
+        cancelWorker(reconnectRunnable);
+        cancelWorker(pingRunnable);
         WebSocket prev;
         synchronized (lock) {
             prev = socket;
@@ -106,10 +120,54 @@ public final class OpenIMWebSocket {
             } catch (Throwable ignore) {
             }
         }
+        Log.e(TAG, "stopped");
     }
 
     public boolean isRunning() {
         return running;
+    }
+
+    public boolean isConnected() {
+        synchronized (lock) {
+            return socket != null && socket.isOpen();
+        }
+    }
+
+    private void ensureWorker() {
+        synchronized (lock) {
+            if (workerThread != null && workerThread.isAlive() && workerHandler != null) {
+                return;
+            }
+            workerThread = new HandlerThread("kgram-ws-worker");
+            workerThread.start();
+            workerHandler = new Handler(workerThread.getLooper());
+        }
+    }
+
+    private void postWorker(Runnable r, long delayMs) {
+        ensureWorker();
+        Handler h;
+        synchronized (lock) {
+            h = workerHandler;
+        }
+        if (h == null) {
+            return;
+        }
+        if (delayMs <= 0) {
+            h.post(r);
+        } else {
+            h.postDelayed(r, delayMs);
+        }
+    }
+
+    private void cancelWorker(Runnable r) {
+        Handler h;
+        synchronized (lock) {
+            h = workerHandler;
+        }
+        if (h != null) {
+            h.removeCallbacks(r);
+        }
     }
 
     private void connectInternal() {
@@ -139,8 +197,6 @@ public final class OpenIMWebSocket {
         }
         try {
             String op = "kgram-" + UUID.randomUUID();
-            // Do NOT pass empty compression — OpenIM ParseBool/fields are picky.
-            // Uncompressed JSON frames (sdkType=js).
             String url = KgramServerConfig.IM_WS
                     + "/?sendID=" + enc(uid)
                     + "&token=" + enc(tok)
@@ -149,25 +205,27 @@ public final class OpenIMWebSocket {
                     + "&isBackground=" + (isAppBackground() ? "true" : "false")
                     + "&isMsgResp=true"
                     + "&operationID=" + enc(op);
-            FileLog.d("kgram ws connecting attempt=" + attempt);
+            Log.e(TAG, "connecting attempt=" + attempt + " bg=" + isAppBackground());
+            FileLog.e("kgram ws connecting attempt=" + attempt);
             WebSocket ws = new WebSocketFactory().setConnectionTimeout(12_000).createSocket(url);
             ws.addListener(new WebSocketAdapter() {
                 @Override
                 public void onConnected(WebSocket websocket, Map<String, List<String>> headers) {
-                    AndroidUtilities.runOnUIThread(() -> {
+                    postWorker(() -> {
                         if (!isCurrent(websocket, attempt)) {
                             websocket.disconnect();
                             return;
                         }
-                        FileLog.d("kgram ws connected");
+                        Log.e(TAG, "connected");
+                        FileLog.e("kgram ws connected");
                         backoffMs = 1000;
-                        AndroidUtilities.cancelRunOnUIThread(pingRunnable);
-                        AndroidUtilities.runOnUIThread(pingRunnable, 5000);
+                        cancelWorker(pingRunnable);
+                        postWorker(pingRunnable, 5000);
                         Listener l = listener;
                         if (l != null) {
-                            l.onConnected();
+                            AndroidUtilities.runOnUIThread(l::onConnected);
                         }
-                    });
+                    }, 0);
                 }
 
                 @Override
@@ -180,7 +238,6 @@ public final class OpenIMWebSocket {
                     if (binary == null) {
                         return;
                     }
-                    // Uncompressed JSON as binary opcode, or gzip if server compresses.
                     String text;
                     try {
                         if (binary.length >= 2 && (binary[0] & 0xff) == 0x1f && (binary[1] & 0xff) == 0x8b) {
@@ -198,6 +255,7 @@ public final class OpenIMWebSocket {
                             text = new String(binary, StandardCharsets.UTF_8);
                         }
                     } catch (Exception e) {
+                        Log.e(TAG, "binary decode fail", e);
                         FileLog.e("kgram ws binary decode fail");
                         FileLog.e(e);
                         return;
@@ -218,6 +276,7 @@ public final class OpenIMWebSocket {
 
                 @Override
                 public void onError(WebSocket websocket, WebSocketException exception) {
+                    Log.e(TAG, "ws error " + exception);
                     FileLog.e("kgram ws error " + exception);
                 }
             });
@@ -226,6 +285,7 @@ public final class OpenIMWebSocket {
             }
             ws.connectAsynchronously();
         } catch (Throwable t) {
+            Log.e(TAG, "create failed", t);
             FileLog.e(t);
             scheduleReconnect(null, attempt, "create failed");
         }
@@ -239,7 +299,8 @@ public final class OpenIMWebSocket {
         if (payload.length() == 0) {
             return;
         }
-        AndroidUtilities.runOnUIThread(() -> {
+        // Decode on worker; deliver to UI for bridge inject.
+        postWorker(() -> {
             if (!isCurrent(websocket, attempt)) {
                 return;
             }
@@ -248,13 +309,13 @@ public final class OpenIMWebSocket {
                 if ("pong".equals(obj.optString("type"))) {
                     return;
                 }
-                // Handshake ack when isMsgResp=true: {"errCode":0,...} without reqIdentifier
                 if (!obj.has("reqIdentifier") && obj.optInt("errCode", 0) == 0 && !obj.has("data")) {
-                    FileLog.d("kgram ws handshake ok");
+                    Log.e(TAG, "handshake ok");
                     return;
                 }
                 int reqId = obj.optInt("reqIdentifier", 0);
                 if (reqId == WS_KICK) {
+                    Log.e(TAG, "kicked");
                     FileLog.e("kgram ws kicked");
                     scheduleReconnect(websocket, attempt, "kicked");
                     return;
@@ -268,33 +329,36 @@ public final class OpenIMWebSocket {
                 }
                 byte[] raw = Base64.decode(dataB64, Base64.DEFAULT);
                 OpenIMProtoLite.DecodedPush push = OpenIMProtoLite.decodePushMessages(raw);
-                FileLog.d("kgram ws push msgs=" + push.messages.size() + " receipts=" + push.receipts.size());
+                Log.e(TAG, "push msgs=" + push.messages.size() + " receipts=" + push.receipts.size());
+                FileLog.e("kgram ws push msgs=" + push.messages.size() + " receipts=" + push.receipts.size());
                 Listener l = listener;
                 if (l != null) {
-                    l.onPushMessages(push);
+                    AndroidUtilities.runOnUIThread(() -> l.onPushMessages(push));
                 }
             } catch (Throwable t) {
+                Log.e(TAG, "payload handle failed", t);
                 FileLog.e(t);
             }
-        });
+        }, 0);
     }
 
     private void scheduleReconnect(WebSocket websocket, int attempt, String reason) {
-        AndroidUtilities.runOnUIThread(() -> {
+        postWorker(() -> {
             if (!running || generation.get() != attempt) {
                 return;
             }
+            Log.e(TAG, "reconnect: " + reason);
             FileLog.e("kgram ws reconnect: " + reason);
-            AndroidUtilities.cancelRunOnUIThread(pingRunnable);
+            cancelWorker(pingRunnable);
             Listener l = listener;
             if (l != null) {
-                l.onDisconnected(reason);
+                AndroidUtilities.runOnUIThread(() -> l.onDisconnected(reason));
             }
             int delay = backoffMs;
             backoffMs = Math.min(30_000, Math.max(1000, backoffMs * 2));
-            AndroidUtilities.cancelRunOnUIThread(reconnectRunnable);
-            AndroidUtilities.runOnUIThread(reconnectRunnable, delay);
-        });
+            cancelWorker(reconnectRunnable);
+            postWorker(reconnectRunnable, delay);
+        }, 0);
     }
 
     private boolean isCurrent(WebSocket ws, int attempt) {

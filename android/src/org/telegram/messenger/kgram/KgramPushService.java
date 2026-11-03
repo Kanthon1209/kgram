@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
+import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
@@ -24,10 +25,11 @@ import org.telegram.ui.LaunchActivity;
  * still post {@link KgramNotifications} shade alerts.
  */
 public class KgramPushService extends Service {
-    public static final String CHANNEL_ID = "kgram_push_keepalive";
+    public static final String CHANNEL_ID = "kgram_push_keepalive_v2";
     public static final int NOTIFY_ID = 70999;
     public static final String ACTION_ENSURE = "org.telegram.messenger.kgram.ENSURE_PUSH";
     public static final String ACTION_STOP = "org.telegram.messenger.kgram.STOP_PUSH";
+    private static final String TAG = "kgram-fgs";
 
     private static volatile boolean started;
 
@@ -36,6 +38,7 @@ public class KgramPushService extends Service {
             return;
         }
         if (!KgramSession.hasSession(ctx)) {
+            Log.e(TAG, "ensureStarted skipped: no session");
             return;
         }
         try {
@@ -46,7 +49,9 @@ public class KgramPushService extends Service {
             } else {
                 ctx.startService(i);
             }
+            Log.e(TAG, "ensureStarted dispatched");
         } catch (Throwable t) {
+            Log.e(TAG, "ensureStarted failed", t);
             FileLog.e(t);
         }
     }
@@ -76,43 +81,22 @@ public class KgramPushService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        ensureKeepAliveChannel();
-        try {
-            Notification n = buildKeepAliveNotification();
-            if (Build.VERSION.SDK_INT >= 29) {
-                startForeground(NOTIFY_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-            } else {
-                startForeground(NOTIFY_ID, n);
-            }
-            started = true;
-        } catch (Throwable t) {
-            FileLog.e(t);
-            // Still try to keep WS even if FGS notification fails.
-        }
+        Log.e(TAG, "onCreate");
+        promoteForeground();
         bootBridge();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent != null ? intent.getAction() : null;
+        Log.e(TAG, "onStartCommand action=" + action);
         if (ACTION_STOP.equals(action)) {
             started = false;
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
         }
-        ensureKeepAliveChannel();
-        try {
-            Notification n = buildKeepAliveNotification();
-            if (Build.VERSION.SDK_INT >= 29) {
-                startForeground(NOTIFY_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-            } else {
-                startForeground(NOTIFY_ID, n);
-            }
-            started = true;
-        } catch (Throwable t) {
-            FileLog.e(t);
-        }
+        promoteForeground();
         bootBridge();
         return START_STICKY;
     }
@@ -120,8 +104,8 @@ public class KgramPushService extends Service {
     @Override
     public void onDestroy() {
         started = false;
+        Log.e(TAG, "onDestroy");
         super.onDestroy();
-        // If session still valid, ask Android to recreate (sticky + explicit restart).
         Context ctx = ApplicationLoader.applicationContext;
         if (ctx != null && KgramServerConfig.USE_OPENIM_AUTH && KgramSession.hasSession(ctx)) {
             try {
@@ -136,6 +120,25 @@ public class KgramPushService extends Service {
         return null;
     }
 
+    private void promoteForeground() {
+        ensureKeepAliveChannel();
+        try {
+            Notification n = buildKeepAliveNotification();
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIFY_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                startForeground(NOTIFY_ID, n);
+            }
+            started = true;
+            Log.e(TAG, "startForeground OK");
+        } catch (Throwable t) {
+            Log.e(TAG, "startForeground FAILED", t);
+            FileLog.e(t);
+            // Still try to keep WS even if FGS notification fails.
+            started = false;
+        }
+    }
+
     private void bootBridge() {
         try {
             Context ctx = getApplicationContext();
@@ -144,11 +147,19 @@ public class KgramPushService extends Service {
             }
             ApplicationLoader.postInitApplication();
         } catch (Throwable t) {
+            Log.e(TAG, "postInitApplication failed", t);
             FileLog.e(t);
         }
         try {
+            KgramNotifications.ensureChannel(getApplicationContext());
             KgramTgBridge.ensurePushRuntime();
+            if (KgramSession.hasSession(getApplicationContext())) {
+                OpenIMWebSocket ws = OpenIMWebSocket.getInstance();
+                Log.e(TAG, "bootBridge WS running=" + ws.isRunning()
+                        + " connected=" + ws.isConnected());
+            }
         } catch (Throwable t) {
+            Log.e(TAG, "bootBridge failed", t);
             FileLog.e(t);
         }
     }
@@ -161,6 +172,10 @@ public class KgramPushService extends Service {
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             if (nm == null) {
                 return;
+            }
+            try {
+                nm.deleteNotificationChannel("kgram_push_keepalive");
+            } catch (Throwable ignore) {
             }
             NotificationChannel existing = nm.getNotificationChannel(CHANNEL_ID);
             if (existing == null) {

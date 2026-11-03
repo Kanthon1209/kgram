@@ -38,3 +38,7 @@ Fix:
 - OpenIM mode: never show Waiting/Connecting/Updating overlays (ChatAvatarContainer, LaunchActivity, DialogsActivity, ProfileActivity, ChatActivity).
 - ConnectionsManager: pause MTProto only; force Java `connectionState=Connected`; `forceOpenImUiConnected()`; ignore `setIsUpdating`.
 - MTProto `sendRequest` still dropped (`KGRAM_OPENIM_ONLY`).
+
+## v0.1.16 (sysnotify-fix2)
+- Fix shade notifications: permission retry, bg watch clear, WS worker thread, channel v3, BOOT FGS
+- APK: kgram-beta-sysnotify-fix2-debug.apk
