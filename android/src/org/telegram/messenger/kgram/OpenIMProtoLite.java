@@ -23,12 +23,15 @@ public final class OpenIMProtoLite {
         public String clientMsgID;
         public String serverMsgID;
         public String senderNickname;
+        public int sessionType;
+        public int msgFrom;
         public int contentType;
         public String content;
         public long seq;
         public long sendTime;
         public long createTime;
         public int status;
+        public boolean isRead;
         public boolean fromNotificationMap;
 
         public long bestSendTimeMs() {
@@ -161,11 +164,15 @@ public final class OpenIMProtoLite {
                 } else if (wire == 0) {
                     long v = r.readVarint64();
                     switch (field) {
+                        case 9: m.sessionType = (int) v; break;
+                        case 10: m.msgFrom = (int) v; break;
                         case 11: m.contentType = (int) v; break;
-                        case 13: m.seq = v; break;
-                        case 14: m.sendTime = v; break;
-                        case 15: m.createTime = v; break;
-                        case 16: m.status = (int) v; break;
+                        // MsgData: content=12(bytes), seq=14, sendTime=15, createTime=16, status=17, isRead=18
+                        case 14: m.seq = v; break;
+                        case 15: m.sendTime = v; break;
+                        case 16: m.createTime = v; break;
+                        case 17: m.status = (int) v; break;
+                        case 18: m.isRead = v != 0; break;
                         default: break;
                     }
                 } else {
@@ -196,24 +203,67 @@ public final class OpenIMProtoLite {
     }
 
     private static ReadReceipt toReceipt(PushMsg msg) {
-        if (msg == null || msg.content == null) {
+        if (msg == null) {
             return null;
         }
         try {
-            JSONObject root = new JSONObject(msg.content);
-            String detail = root.optString("detail", null);
-            JSONObject d = detail != null && detail.length() > 0 ? new JSONObject(detail) : root;
+            JSONObject d = null;
+            if (msg.content != null && msg.content.length() > 0) {
+                JSONObject root = new JSONObject(msg.content);
+                String detail = root.optString("detail", "");
+                if (detail == null || detail.length() == 0) {
+                    detail = root.optString("jsonDetail", "");
+                }
+                if (detail != null && detail.length() > 0) {
+                    String trimmed = detail.trim();
+                    if (trimmed.startsWith("{")) {
+                        d = new JSONObject(trimmed);
+                    }
+                }
+                if (d == null) {
+                    d = root;
+                }
+            }
+            if (d == null) {
+                d = new JSONObject();
+            }
             ReadReceipt rr = new ReadReceipt();
-            rr.conversationID = d.optString("conversationID", msg.conversationID);
-            rr.markAsReadUserID = d.optString("markAsReadUserID", null);
+            rr.conversationID = firstNonEmpty(
+                    d.optString("conversationID", null),
+                    d.optString("ConversationID", null),
+                    msg.conversationID);
+            rr.markAsReadUserID = firstNonEmpty(
+                    d.optString("markAsReadUserID", null),
+                    d.optString("MarkAsReadUserID", null),
+                    msg.sendID);
             rr.hasReadSeq = d.optLong("hasReadSeq", 0);
-            if (rr.hasReadSeq <= 0 && d.has("seqs")) {
-                // fallback: max of seqs array
+            if (rr.hasReadSeq <= 0) {
+                rr.hasReadSeq = d.optLong("HasReadSeq", 0);
+            }
+            if (rr.hasReadSeq <= 0) {
                 org.json.JSONArray arr = d.optJSONArray("seqs");
+                if (arr == null) arr = d.optJSONArray("Seqs");
                 if (arr != null) {
                     for (int i = 0; i < arr.length(); i++) {
                         long s = arr.optLong(i);
                         if (s > rr.hasReadSeq) rr.hasReadSeq = s;
+                    }
+                }
+            }
+            // Notification map key is often n_a_b — prefer si_ from tips; else rewrite n_ → si_.
+            if (rr.conversationID != null && rr.conversationID.startsWith("n_")) {
+                rr.conversationID = "si_" + rr.conversationID.substring(2);
+            }
+            if ((rr.conversationID == null || rr.conversationID.length() == 0) && rr.markAsReadUserID != null
+                    && msg.recvID != null && msg.recvID.length() > 0) {
+                // Last resort: synthesize single-chat id from reader + receiver.
+                String a = rr.markAsReadUserID;
+                String b = msg.recvID.equals(a) ? msg.sendID : msg.recvID;
+                if (b != null && b.length() > 0) {
+                    if (a.compareTo(b) <= 0) {
+                        rr.conversationID = "si_" + a + "_" + b;
+                    } else {
+                        rr.conversationID = "si_" + b + "_" + a;
                     }
                 }
             }
@@ -224,6 +274,14 @@ public final class OpenIMProtoLite {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static String firstNonEmpty(String... vals) {
+        if (vals == null) return null;
+        for (String v : vals) {
+            if (v != null && v.length() > 0 && !"null".equals(v)) return v;
+        }
+        return null;
     }
 
     public static String extractText(String contentJson) {
@@ -239,12 +297,19 @@ public final class OpenIMProtoLite {
         }
     }
 
-    /** Peer userID from {@code si_a_b} given my userID. */
+    /** Peer userID from {@code si_a_b} / {@code n_a_b} given my userID. */
     public static String peerFromConversationID(String conversationID, String me) {
-        if (conversationID == null || !conversationID.startsWith("si_") || me == null) {
+        if (conversationID == null || me == null) {
             return null;
         }
-        String rest = conversationID.substring(3);
+        String id = conversationID;
+        if (id.startsWith("n_")) {
+            id = "si_" + id.substring(2);
+        }
+        if (!id.startsWith("si_")) {
+            return null;
+        }
+        String rest = id.substring(3);
         int idx = rest.indexOf('_');
         if (idx <= 0) {
             return null;

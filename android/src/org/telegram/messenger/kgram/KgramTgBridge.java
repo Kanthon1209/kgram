@@ -560,6 +560,9 @@ public final class KgramTgBridge {
         final String convID = OpenIMImClient.singleConversationID(me, peer);
         // Watching is owned by ChatActivity onResume/onPause only.
         ensureWebSocket();
+        // Instant paint from local cache so reopen is not empty while network loads.
+        restoreCachedMessages(account, me, peer, dialogId, convID, count, max_id, classGuid,
+                last_message_id, load_type, mode, loadIndex);
         // Ensure friendship so history/send is allowed on OpenIM.
         OpenIMImClient.ensureFriendAsync(me, peer, ignored -> {
             OpenIMImClient.ensureFriendAsync(peer, me, ignored2 -> {
@@ -668,6 +671,10 @@ public final class KgramTgBridge {
                             d.top_message = (int) Math.min(maxSeq, Integer.MAX_VALUE);
                         }
                     }
+                    // Persist recent history so next open is instant.
+                    if (result.ok() && result.data != null && !result.data.isEmpty()) {
+                        KgramMessageCache.save(org.telegram.messenger.ApplicationLoader.applicationContext, convID, result.data);
+                    }
                     // isCache=false so unread is derived from outbox/inbox max maps above.
                     mc.processLoadedMessages(res, res.messages.size(), dialogId, 0, count, max_id, 0, false, classGuid,
                             0, last_message_id, 0, 0, load_type, true, mode, 0, loadIndex, false, 0, true, false, null);
@@ -775,6 +782,22 @@ public final class KgramTgBridge {
                         noteMessageKeys(dialogId, seq, gotClient, serverMsgID);
                         Long prevMax = knownMaxSeq.get(dialogId);
                         knownMaxSeq.put(dialogId, Math.max(seq, prevMax != null ? prevMax : 0));
+                    }
+                    try {
+                        OpenIMImClient.ChatMessage cm = new OpenIMImClient.ChatMessage();
+                        cm.sendID = me;
+                        cm.recvID = peer;
+                        cm.clientMsgID = gotClient;
+                        cm.serverMsgID = serverMsgID;
+                        cm.text = textMsg;
+                        cm.sendTime = sendTime;
+                        cm.contentType = OpenIMProtoLite.CONTENT_TEXT;
+                        cm.seq = seq;
+                        ArrayList<OpenIMImClient.ChatMessage> one = new ArrayList<>();
+                        one.add(cm);
+                        KgramMessageCache.mergeAndSave(org.telegram.messenger.ApplicationLoader.applicationContext,
+                                OpenIMImClient.singleConversationID(me, peer), one);
+                    } catch (Throwable ignore) {
                     }
 
                     // Outbox checkmarks only follow real peer hasReadSeq receipts.
@@ -927,6 +950,8 @@ public final class KgramTgBridge {
             } catch (Throwable ignore) {
             }
             KgramNotifications.cancelDialog(account, dialogId);
+            // Chat became visible — pull peer hasReadSeq once so ticks catch up if WS tip was missed.
+            refreshPeerOutboxFromServer(account, dialogId);
         } else {
             watchedDialogs.remove(dialogId);
             try {
@@ -1053,16 +1078,28 @@ public final class KgramTgBridge {
             if (push.receipts != null) {
                 for (OpenIMProtoLite.ReadReceipt rr : push.receipts) {
                     if (rr == null || rr.hasReadSeq <= 0) continue;
+                    // Own mark-read tips update OUR unread — not peer outbox ticks.
                     if (rr.markAsReadUserID != null && rr.markAsReadUserID.equals(me)) {
                         continue;
                     }
                     String peer = OpenIMProtoLite.peerFromConversationID(rr.conversationID, me);
+                    if ((peer == null || peer.length() == 0) && rr.markAsReadUserID != null
+                            && rr.markAsReadUserID.length() > 0 && !rr.markAsReadUserID.equals(me)) {
+                        // Tips conversation id missing/odd — reader is the peer.
+                        peer = rr.markAsReadUserID;
+                    }
                     if (peer == null || peer.length() == 0) {
+                        FileLog.d("kgram receipt drop no-peer conv=" + rr.conversationID
+                                + " reader=" + rr.markAsReadUserID + " has=" + rr.hasReadSeq);
                         continue;
                     }
                     long did = parseUserId(peer);
+                    if (did <= 0) {
+                        continue;
+                    }
                     int has = (int) Math.min(rr.hasReadSeq, Integer.MAX_VALUE);
                     receiptBatch.add(new long[]{did, has});
+                    FileLog.d("kgram receipt peer=" + peer + " hasReadSeq=" + has + " conv=" + rr.conversationID);
                 }
             }
             final HashMap<String, ArrayList<OpenIMImClient.ChatMessage>> byPeer = new HashMap<>();
@@ -1111,6 +1148,8 @@ public final class KgramTgBridge {
                 try {
                     for (long[] pair : receiptBatch) {
                         applyPeerOutboxRead(account, pair[0], (int) pair[1]);
+                        // Belt-and-suspenders: confirm cursor from server (no polling loop).
+                        refreshPeerOutboxFromServer(account, pair[0]);
                     }
                     for (Map.Entry<String, ArrayList<OpenIMImClient.ChatMessage>> e : byPeer.entrySet()) {
                         String peer = e.getKey();
@@ -1228,6 +1267,12 @@ public final class KgramTgBridge {
         }
         if (newMax > last) {
             knownMaxSeq.put(dialogId, newMax);
+        }
+        // Keep disk cache warm even when UI already had the rows (deduped).
+        try {
+            KgramMessageCache.mergeAndSave(org.telegram.messenger.ApplicationLoader.applicationContext,
+                    OpenIMImClient.singleConversationID(me, peer), sorted);
+        } catch (Throwable ignore) {
         }
         if (fresh.isEmpty()) {
             return;
@@ -1420,25 +1465,95 @@ public final class KgramTgBridge {
                 + " client=" + clientMsgID);
     }
 
+    /** Paint last-N cached OpenIM messages immediately (isCache=true), network follows. */
+    private static void restoreCachedMessages(int account, String me, String peer, long dialogId,
+                                              String convID, int count, int max_id, int classGuid,
+                                              int last_message_id, int load_type, int mode, int loadIndex) {
+        try {
+            Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
+            List<OpenIMImClient.ChatMessage> cached = KgramMessageCache.load(ctx, convID);
+            if (cached == null || cached.isEmpty()) {
+                return;
+            }
+            MessagesController mc = MessagesController.getInstance(account);
+            TLRPC.TL_messages_messages res = new TLRPC.TL_messages_messages();
+            TLRPC.User peerUser = mc.getUser(dialogId);
+            if (peerUser != null) {
+                res.users.add(peerUser);
+            } else {
+                TLRPC.TL_user created = toUser(peer, peer, null);
+                mc.putUser(created, false);
+                res.users.add(created);
+            }
+            TLRPC.User self = UserConfig.getInstance(account).getCurrentUser();
+            if (self != null) {
+                res.users.add(self);
+            }
+            int peerHas = 0;
+            Integer appliedOut = peerHasReadApplied.get(dialogId);
+            if (appliedOut != null) {
+                peerHas = appliedOut;
+            }
+            Integer outbox = mc.dialogs_read_outbox_max.get(dialogId);
+            if (outbox != null) {
+                peerHas = Math.max(peerHas, outbox);
+            }
+            ArrayList<OpenIMImClient.ChatMessage> sorted = new ArrayList<>(cached);
+            sorted.sort((a, b) -> {
+                long sa = a.seq > 0 ? a.seq : a.sendTime;
+                long sb = b.seq > 0 ? b.seq : b.sendTime;
+                int c = Long.compare(sa, sb);
+                if (c != 0) return c;
+                return Long.compare(a.sendTime, b.sendTime);
+            });
+            long maxSeq = 0;
+            ArrayList<TLRPC.Message> built = new ArrayList<>();
+            HashSet<Long> seenSeq = new HashSet<>();
+            for (OpenIMImClient.ChatMessage m : sorted) {
+                long seq = m.seq > 0 ? m.seq : 0;
+                if (seq > 0 && !seenSeq.add(seq)) continue;
+                int id = seq > 0 ? (int) Math.min(Math.max(seq, 1), Integer.MAX_VALUE) : localMsgId.getAndDecrement();
+                boolean out = me.equals(m.sendID);
+                boolean outUnread = out && id > peerHas && id > 0;
+                TLRPC.TL_message msg = buildMessage(me, peer, m.text, m.sendTime, id, out, false, outUnread);
+                built.add(msg);
+                noteMessageKeys(dialogId, seq, m.clientMsgID, m.serverMsgID);
+                if (seq > maxSeq) maxSeq = seq;
+            }
+            for (int i = built.size() - 1; i >= 0; i--) {
+                res.messages.add(built.get(i));
+            }
+            if (maxSeq > 0) {
+                knownMaxSeq.put(dialogId, Math.max(knownMaxSeq.get(dialogId) != null ? knownMaxSeq.get(dialogId) : 0, maxSeq));
+            }
+            mc.processLoadedMessages(res, res.messages.size(), dialogId, 0, count, max_id, 0, true, classGuid,
+                    0, last_message_id, 0, 0, load_type, true, mode, 0, loadIndex, false, 0, true, false, null);
+            FileLog.d("kgram cache restore conv=" + convID + " n=" + built.size());
+        } catch (Throwable t) {
+            FileLog.e(t);
+        }
+    }
+
     /** Apply peer hasReadSeq as TG read_outbox_max (double-check for id <= peerHas). */
     public static void applyPeerOutboxRead(int account, long dialogId, int peerHasReadSeq) {
-        if (dialogId <= 0 || peerHasReadSeq < 0) {
+        if (dialogId <= 0 || peerHasReadSeq <= 0) {
             return;
         }
         Integer prev = peerHasReadApplied.get(dialogId);
-        if (prev != null && peerHasReadSeq <= prev) {
-            // Still refresh map in case UI missed
-            if (peerHasReadSeq == prev) {
-                return;
-            }
-        }
         MessagesController mc = MessagesController.getInstance(account);
         Integer cur = mc.dialogs_read_outbox_max.get(dialogId);
         int next = peerHasReadSeq;
         if (cur != null) {
             next = Math.max(cur, peerHasReadSeq);
         }
+        if (prev != null) {
+            next = Math.max(prev, next);
+        }
         if (prev != null && next <= prev && cur != null && next <= cur) {
+            // Re-broadcast so ChatActivity can catch a missed tick paint.
+            LongSparseIntArray outbox0 = new LongSparseIntArray(1);
+            outbox0.put(dialogId, next);
+            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messagesRead, null, outbox0);
             return;
         }
         peerHasReadApplied.put(dialogId, next);
@@ -1447,7 +1562,6 @@ public final class KgramTgBridge {
         if (d != null) {
             d.read_outbox_max_id = Math.max(d.read_outbox_max_id, next);
         }
-        // Update dialog preview message unread flag
         ArrayList<MessageObject> preview = mc.dialogMessage.get(dialogId);
         if (preview != null) {
             for (MessageObject mo : preview) {
@@ -1462,6 +1576,35 @@ public final class KgramTgBridge {
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messagesRead, null, outbox);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_READ_DIALOG_MESSAGE);
         FileLog.d("kgram peer read outbox dialog=" + dialogId + " hasReadSeq=" + next);
+    }
+
+    /** One-shot HTTP refresh of peer hasReadSeq (no timer / no poll). */
+    public static void refreshPeerOutboxFromServer(final int account, final long dialogId) {
+        Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
+        if (!enabled(ctx) || dialogId <= 0) {
+            return;
+        }
+        final String me = KgramSession.userID(ctx);
+        final String peer = openImId(dialogId);
+        final String token = KgramSession.imToken(ctx);
+        if (me == null || peer == null || token == null) {
+            return;
+        }
+        final String convID = OpenIMImClient.singleConversationID(me, peer);
+        OpenIMImClient.getPeerHasReadSeqAsync(peer, convID, token, res -> AndroidUtilities.runOnUIThread(() -> {
+            try {
+                if (res == null || !res.ok() || res.data == null) {
+                    return;
+                }
+                long has = res.data;
+                if (has <= 0) {
+                    return;
+                }
+                applyPeerOutboxRead(account, dialogId, (int) Math.min(has, Integer.MAX_VALUE));
+            } catch (Throwable t) {
+                FileLog.e(t);
+            }
+        }));
     }
 
 }

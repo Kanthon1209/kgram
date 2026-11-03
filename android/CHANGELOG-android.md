@@ -42,3 +42,10 @@ Fix:
 ## v0.1.16 (sysnotify-fix2)
 - Fix shade notifications: permission retry, bg watch clear, WS worker thread, channel v3, BOOT FGS
 - APK: kgram-beta-sysnotify-fix2-debug.apk
+
+## v0.1.18-read-cache-debug (2026-11-03 14:10 CST)
+- Fix OpenIM MsgData protobuf field map (seq was off-by-one) so WS payloads decode correctly.
+- Harden hasReadSeq receipt parse (n_/si_, detail/jsonDetail, markAsReadUserID peer fallback).
+- Apply peer outbox ticks immediately via WS + one-shot server refresh on receipt/chat visible (no polling).
+- Lightweight local message cache (last ~120/conv) so reopen chat is not empty.
+

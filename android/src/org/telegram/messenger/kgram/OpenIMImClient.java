@@ -221,11 +221,26 @@ public final class OpenIMImClient {
                 List<String> ids = new ArrayList<>();
                 ids.add(conversationID);
                 ApiResult<Map<String, SeqInfo>> res = getHasReadAndMaxSeq(peerUserID, ids, imToken);
+                // User token may be rejected when ownerUserID != token subject — retry as admin.
+                if (res == null || !res.ok() || res.data == null || !res.data.containsKey(conversationID)) {
+                    try {
+                        String admin = getAdminToken();
+                        ApiResult<Map<String, SeqInfo>> adminRes = getHasReadAndMaxSeq(peerUserID, ids, admin);
+                        if (adminRes != null && adminRes.ok()) {
+                            res = adminRes;
+                        }
+                    } catch (Exception ignore) {
+                    }
+                }
                 long has = 0;
-                if (res.ok() && res.data != null && res.data.containsKey(conversationID)) {
+                if (res != null && res.ok() && res.data != null && res.data.containsKey(conversationID)) {
                     has = res.data.get(conversationID).hasReadSeq;
                 }
-                cb.onDone(new ApiResult<>(res.errCode, res.errMsg, res.errDlt, has, res.raw));
+                int code = res == null ? -1 : res.errCode;
+                String msg = res == null ? "null" : res.errMsg;
+                String dlt = res == null ? "" : res.errDlt;
+                String raw = res == null ? null : res.raw;
+                cb.onDone(new ApiResult<>(code, msg, dlt, has, raw));
             } catch (Exception e) {
                 cb.onDone(new ApiResult<>(-1, e.getMessage(), "", 0L, null));
             }
