@@ -7,8 +7,6 @@ import android.graphics.PorterDuffColorFilter;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -69,17 +67,7 @@ public class KgramChatActivity extends FragmentActivity {
     private ActionBar actionBar;
     private SizeNotifierFrameLayout contentView;
     private int actionBarHeight;
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private boolean polling;
     private String lastFingerprint = "";
-
-    // Realtime via OpenIMWebSocket in KgramTgBridge; local poll disabled.
-    private final Runnable pollRunnable = new Runnable() {
-        @Override
-        public void run() {
-            // Disabled: realtime is OpenIM WebSocket via KgramTgBridge.
-        }
-    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -262,16 +250,8 @@ public class KgramChatActivity extends FragmentActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        polling = false;
-        handler.removeCallbacks(pollRunnable);
+        // One-shot user-visible refresh only (no timer poll). Realtime is OpenIM WS via bridge.
         reload(false);
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        polling = false;
-        handler.removeCallbacks(pollRunnable);
     }
 
     private void sendMessage() {

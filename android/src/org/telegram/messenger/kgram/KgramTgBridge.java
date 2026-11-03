@@ -15,6 +15,7 @@ import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.SendMessagesHelper;
 import org.telegram.messenger.UserConfig;
+import org.telegram.messenger.Utilities;
 import org.telegram.ui.Components.ForegroundDetector;
 import org.telegram.tgnet.TLRPC;
 
@@ -25,7 +26,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+import org.telegram.messenger.BuildVars;
 
 /**
  * Bridges OpenIM network data into Telegram-Android UI controllers.
@@ -51,6 +56,20 @@ public final class KgramTgBridge {
     private static boolean wsStarted = false;
     private static volatile boolean fgListenerRegistered = false;
     private static final String NOTIFY_TAG = "kgram-notify";
+    /** Debounce full conversation list HTTP reload (send/WS must not thrash this). */
+    private static final AtomicLong lastDialogsLoadAt = new AtomicLong(0);
+    private static final AtomicBoolean dialogsLoadInFlight = new AtomicBoolean(false);
+    private static final AtomicBoolean dialogsReloadPending = new AtomicBoolean(false);
+    private static final long DIALOGS_LOAD_MIN_INTERVAL_MS = 2500L;
+    private static final Runnable debouncedDialogsNeedReload = () -> {
+        dialogsReloadPending.set(false);
+        try {
+            int account = UserConfig.selectedAccount;
+            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
+        } catch (Throwable t) {
+            FileLog.e(t);
+        }
+    };
     private static final OpenIMWebSocket.Listener wsListener = new OpenIMWebSocket.Listener() {
         @Override
         public void onPushMessages(OpenIMProtoLite.DecodedPush push) {
@@ -122,7 +141,7 @@ public final class KgramTgBridge {
         MessagesController.getInstance(account).putUser(user, false);
         FileLog.d("kgram bridge activated userId=" + myId);
         // Warm dialogs + contacts immediately after login.
-        loadDialogsOpenIM(account, 0);
+        loadDialogsOpenIM(account, 0, true);
         loadContactsOpenIM(account);
         ensureWebSocket();
         ensurePushRuntime();
@@ -186,33 +205,103 @@ public final class KgramTgBridge {
         return user;
     }
 
+
+    private static void dlog(String msg) {
+        if (BuildVars.LOGS_ENABLED) {
+            FileLog.d(msg);
+        }
+    }
+
+    private static void nlog(String msg) {
+        if (BuildVars.LOGS_ENABLED) {
+            Log.d(NOTIFY_TAG, msg);
+        }
+    }
+
+    /** Lightweight dialogs list invalidate; coalesces bursts from WS/send. */
+    private static void scheduleDialogsListRefresh() {
+        if (dialogsReloadPending.compareAndSet(false, true)) {
+            AndroidUtilities.cancelRunOnUIThread(debouncedDialogsNeedReload);
+            AndroidUtilities.runOnUIThread(debouncedDialogsNeedReload, 450);
+        } else {
+            AndroidUtilities.cancelRunOnUIThread(debouncedDialogsNeedReload);
+            AndroidUtilities.runOnUIThread(debouncedDialogsNeedReload, 450);
+        }
+    }
+
+    private static void bumpDialogPreview(int account, long dialogId, MessageObject lastMo, long newMax) {
+        if (lastMo == null) {
+            return;
+        }
+        MessagesController mc = MessagesController.getInstance(account);
+        ArrayList<MessageObject> preview = new ArrayList<>();
+        preview.add(lastMo);
+        mc.dialogMessage.put(dialogId, preview);
+        TLRPC.Dialog d = mc.dialogs_dict.get(dialogId);
+        if (d != null) {
+            if (newMax > 0) {
+                d.top_message = (int) Math.min(Math.max(newMax, d.top_message), Integer.MAX_VALUE);
+            } else if (lastMo.getId() > 0) {
+                d.top_message = Math.max(d.top_message, lastMo.getId());
+            }
+            if (lastMo.messageOwner != null) {
+                d.last_message_date = lastMo.messageOwner.date;
+            }
+        }
+        NotificationCenter.getInstance(account).postNotificationName(
+                NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_NAME | MessagesController.UPDATE_MASK_MESSAGE_TEXT);
+    }
+
     /** Called from MessagesController.loadDialogs when OpenIM mode is on. */
     public static boolean loadDialogsOpenIM(final int account, final int folderId) {
+        return loadDialogsOpenIM(account, folderId, false);
+    }
+
+    public static boolean loadDialogsOpenIM(final int account, final int folderId, final boolean force) {
         Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
         if (!enabled(ctx) || folderId != 0) {
             return false;
         }
         final MessagesController mc = MessagesController.getInstance(account);
+        long now = System.currentTimeMillis();
+        long last = lastDialogsLoadAt.get();
+        if (!force && dialogsLoadInFlight.get()) {
+            dlog("kgram dialogs load skipped in-flight");
+            // MessagesController already set loadingDialogs=true; clear so UI is not stuck.
+            mc.kgramMarkDialogsLoaded(folderId);
+            return true;
+        }
+        if (!force && last > 0 && (now - last) < DIALOGS_LOAD_MIN_INTERVAL_MS) {
+            dlog("kgram dialogs load debounced dt=" + (now - last));
+            mc.kgramMarkDialogsLoaded(folderId);
+            return true;
+        }
+        if (!dialogsLoadInFlight.compareAndSet(false, true) && !force) {
+            mc.kgramMarkDialogsLoaded(folderId);
+            return true;
+        }
+        lastDialogsLoadAt.set(now);
         final String me = KgramSession.userID(ctx);
         final String token = KgramSession.imToken(ctx);
         OpenIMImClient.getConversationsAsync(me, token, convRes -> {
             OpenIMImClient.getFriendsAsync(me, token, friendRes -> {
-                OpenIMImClient.getAllUsersAsync(allRes -> AndroidUtilities.runOnUIThread(() -> {
+                // Friends cover dialog titles; skip expensive getAllUsers on every refresh.
+                AndroidUtilities.runOnUIThread(() -> {
                     try {
-                        applyDialogs(account, me, convRes, friendRes, allRes);
+                        applyDialogs(account, me, convRes, friendRes, null);
                     } catch (Throwable t) {
                         FileLog.e(t);
                     } finally {
+                        dialogsLoadInFlight.set(false);
                         mc.kgramMarkDialogsLoaded(folderId);
-                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
-                        // Keep contacts in sync with the same snapshot.
+                        // applyDialogs already posts dialogsNeedReload once.
                         try {
-                            applyContacts(account, me, friendRes, allRes);
+                            applyContacts(account, me, friendRes, null);
                         } catch (Throwable t) {
                             FileLog.e(t);
                         }
                     }
-                }));
+                });
             });
         });
         return true;
@@ -444,13 +533,17 @@ public final class KgramTgBridge {
 
     /** Force-refresh OpenIM conversation list (pull-to-refresh / onResume). */
     public static void forceReloadDialogsOpenIM(final int account) {
+        forceReloadDialogsOpenIM(account, false);
+    }
+
+    public static void forceReloadDialogsOpenIM(final int account, boolean immediate) {
         Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
         if (!enabled(ctx)) {
             return;
         }
         // Bypass MessagesController.loadDialogs end/loading gates; hit OpenIM directly.
         MessagesController.getInstance(account).kgramMarkDialogsLoaded(0);
-        loadDialogsOpenIM(account, 0);
+        loadDialogsOpenIM(account, 0, immediate);
     }
 
     /** Called from loadMessagesInternal — returns true if handled. */
@@ -700,9 +793,11 @@ public final class KgramTgBridge {
                         }
                         clearPendingMaps(localId, clientMsgID);
                         clearPendingMaps(localId, gotClient);
-                        FileLog.d("kgram send skip re-post alreadyPresent seq=" + seq + " client=" + gotClient);
-                        ensureWebSocket();
-                        loadDialogsOpenIM(account, 0);
+                        dlog("kgram send skip re-post alreadyPresent seq=" + seq + " client=" + gotClient);
+                        ArrayList<MessageObject> cur = mc.dialogMessage.get(dialogId);
+                        if (cur != null && !cur.isEmpty()) {
+                            bumpDialogPreview(account, dialogId, cur.get(0), seq);
+                        }
                         return;
                     }
 
@@ -715,9 +810,8 @@ public final class KgramTgBridge {
                         }
                         local.send_state = MessageObject.MESSAGE_SEND_STATE_SENT;
                         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByAck, localId);
-                        FileLog.d("kgram send waiting for seq client=" + gotClient);
-                        ensureWebSocket();
-                        loadDialogsOpenIM(account, 0);
+                        dlog("kgram send waiting for seq client=" + gotClient);
+                        bumpDialogPreview(account, dialogId, new MessageObject(account, local, true, false), 0);
                         return;
                     }
 
@@ -735,9 +829,7 @@ public final class KgramTgBridge {
                     if (clientMsgID != null && !clientMsgID.equals(gotClient)) {
                         clearPendingMaps(localId, clientMsgID);
                     }
-                    ensureWebSocket();
-                    // Refresh conversation list preview only; do not re-inject full history here.
-                    loadDialogsOpenIM(account, 0);
+                    bumpDialogPreview(account, dialogId, new MessageObject(account, sent, true, false), seq);
                 }));
             });
         });
@@ -825,7 +917,7 @@ public final class KgramTgBridge {
             } catch (Throwable ignore) {
             }
             if (!fg) {
-                Log.e(NOTIFY_TAG, "ignore watch=true while background dialog=" + dialogId);
+                nlog("ignore watch=true while background dialog=" + dialogId);
                 watchedDialogs.remove(dialogId);
                 return;
             }
@@ -847,7 +939,7 @@ public final class KgramTgBridge {
     /** Clear all open-chat watches — called when app goes to background. */
     public static void clearWatchedDialogsForBackground() {
         if (!watchedDialogs.isEmpty()) {
-            Log.e(NOTIFY_TAG, "clear watchedDialogs on background size=" + watchedDialogs.size());
+            nlog("clear watchedDialogs on background size=" + watchedDialogs.size());
         }
         watchedDialogs.clear();
         try {
@@ -870,7 +962,7 @@ public final class KgramTgBridge {
             det.addListener(new ForegroundDetector.Listener() {
                 @Override
                 public void onBecameForeground() {
-                    Log.e(NOTIFY_TAG, "app foreground");
+                    nlog("app foreground");
                     AndroidUtilities.runOnUIThread(KgramNotifications::requestPermissionIfNeeded, 400);
                     try {
                         KgramPushService.ensureStarted(org.telegram.messenger.ApplicationLoader.applicationContext);
@@ -880,7 +972,7 @@ public final class KgramTgBridge {
 
                 @Override
                 public void onBecameBackground() {
-                    Log.e(NOTIFY_TAG, "app background — clear watches + ensure FGS");
+                    nlog("app background — clear watches + ensure FGS");
                     clearWatchedDialogsForBackground();
                     try {
                         KgramPushService.ensureStarted(org.telegram.messenger.ApplicationLoader.applicationContext);
@@ -889,9 +981,8 @@ public final class KgramTgBridge {
                     ensureWebSocket();
                 }
             });
-            Log.e(NOTIFY_TAG, "ForegroundDetector listener registered");
+            nlog("ForegroundDetector listener registered");
         } catch (Throwable t) {
-            Log.e(NOTIFY_TAG, "registerForegroundListener failed", t);
             FileLog.e(t);
         }
     }
@@ -914,11 +1005,7 @@ public final class KgramTgBridge {
         if (!wsStarted || !ws.isRunning()) {
             wsStarted = true;
             ws.start(me, token);
-            android.util.Log.e(NOTIFY_TAG, "ensureWebSocket start running="
-                    + ws.isRunning() + " connected=" + ws.isConnected());
-        } else {
-            android.util.Log.e(NOTIFY_TAG, "ensureWebSocket already running connected="
-                    + ws.isConnected());
+            nlog("ensureWebSocket start running=" + ws.isRunning() + " connected=" + ws.isConnected());
         }
         try {
             KgramPushService.ensureStarted(ctx);
@@ -937,7 +1024,9 @@ public final class KgramTgBridge {
         AndroidUtilities.runOnUIThread(KgramNotifications::requestPermissionIfNeeded, 300);
         try {
             KgramNotifications.ensureChannel(ctx);
-            KgramNotifications.dumpState(ctx);
+            if (BuildVars.LOGS_ENABLED) {
+                KgramNotifications.dumpState(ctx);
+            }
         } catch (Throwable ignore) {
         }
     }
@@ -951,7 +1040,7 @@ public final class KgramTgBridge {
         }
     }
 
-    /** Handle OpenIM WS push (2001): new messages + hasReadSeq receipts. */
+    /** Handle OpenIM WS push (2001). Called on WS worker — heavy prep stays off main. */
     private static void handleWsPush(OpenIMProtoLite.DecodedPush push) {
         Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
         if (!enabled(ctx) || push == null) {
@@ -960,10 +1049,10 @@ public final class KgramTgBridge {
         final int account = UserConfig.selectedAccount;
         final String me = KgramSession.userID(ctx);
         try {
+            final ArrayList<long[]> receiptBatch = new ArrayList<>();
             if (push.receipts != null) {
                 for (OpenIMProtoLite.ReadReceipt rr : push.receipts) {
                     if (rr == null || rr.hasReadSeq <= 0) continue;
-                    // Only apply outbox when the *peer* marked read.
                     if (rr.markAsReadUserID != null && rr.markAsReadUserID.equals(me)) {
                         continue;
                     }
@@ -973,13 +1062,11 @@ public final class KgramTgBridge {
                     }
                     long did = parseUserId(peer);
                     int has = (int) Math.min(rr.hasReadSeq, Integer.MAX_VALUE);
-                    applyPeerOutboxRead(account, did, has);
+                    receiptBatch.add(new long[]{did, has});
                 }
             }
-            // Collect peers touched by this push (msgs + receipt conversations).
-            HashSet<String> peersToSync = new HashSet<>();
+            final HashMap<String, ArrayList<OpenIMImClient.ChatMessage>> byPeer = new HashMap<>();
             if (push.messages != null && !push.messages.isEmpty()) {
-                HashMap<String, ArrayList<OpenIMImClient.ChatMessage>> byPeer = new HashMap<>();
                 for (OpenIMProtoLite.PushMsg pm : push.messages) {
                     if (pm == null) continue;
                     String peer = null;
@@ -996,7 +1083,6 @@ public final class KgramTgBridge {
                     if (peer == null || peer.length() == 0) {
                         continue;
                     }
-                    peersToSync.add(peer);
                     OpenIMImClient.ChatMessage cm = new OpenIMImClient.ChatMessage();
                     cm.sendID = pm.sendID;
                     cm.recvID = pm.recvID;
@@ -1010,53 +1096,41 @@ public final class KgramTgBridge {
                     if (cm.text == null) {
                         cm.text = "";
                     }
-                    // Direct inject only when server seq is present; otherwise history sync below.
-                    if (cm.seq > 0) {
-                        ArrayList<OpenIMImClient.ChatMessage> list = byPeer.get(peer);
-                        if (list == null) {
-                            list = new ArrayList<>();
-                            byPeer.put(peer, list);
-                        }
-                        list.add(cm);
+                    ArrayList<OpenIMImClient.ChatMessage> list = byPeer.get(peer);
+                    if (list == null) {
+                        list = new ArrayList<>();
+                        byPeer.put(peer, list);
                     }
-                }
-                for (Map.Entry<String, ArrayList<OpenIMImClient.ChatMessage>> e : byPeer.entrySet()) {
-                    String peer = e.getKey();
-                    long did = parseUserId(peer);
-                    OpenIMImClient.ApiResult<List<OpenIMImClient.ChatMessage>> fake =
-                            new OpenIMImClient.ApiResult<>(0, "", "", e.getValue(), null);
-                    injectNewMessagesFromPoll(account, me, peer, did, fake);
+                    list.add(cm);
                 }
             }
-            if (push.receipts != null) {
-                for (OpenIMProtoLite.ReadReceipt rr : push.receipts) {
-                    if (rr == null) continue;
-                    String peer = OpenIMProtoLite.peerFromConversationID(rr.conversationID, me);
-                    if (peer != null) peersToSync.add(peer);
-                }
+            if (receiptBatch.isEmpty() && byPeer.isEmpty()) {
+                return;
             }
-            // WS-triggered history pull for authoritative seq / ordering (not a timer poll).
-            final String token = KgramSession.imToken(ctx);
-            for (String peer : peersToSync) {
-                if (peer == null || peer.length() == 0) continue;
-                final String p = peer;
-                final long did = parseUserId(p);
-                OpenIMImClient.searchHistoryAsync(me, p, token, result -> AndroidUtilities.runOnUIThread(() -> {
-                    try {
-                        injectNewMessagesFromPoll(account, me, p, did, result);
-                    } catch (Throwable t) {
-                        FileLog.e(t);
+            AndroidUtilities.runOnUIThread(() -> {
+                try {
+                    for (long[] pair : receiptBatch) {
+                        applyPeerOutboxRead(account, pair[0], (int) pair[1]);
                     }
-                }));
-            }
+                    for (Map.Entry<String, ArrayList<OpenIMImClient.ChatMessage>> e : byPeer.entrySet()) {
+                        String peer = e.getKey();
+                        long did = parseUserId(peer);
+                        OpenIMImClient.ApiResult<List<OpenIMImClient.ChatMessage>> fake =
+                                new OpenIMImClient.ApiResult<>(0, "", "", e.getValue(), null);
+                        injectNewMessages(account, me, peer, did, fake);
+                    }
+                } catch (Throwable t) {
+                    FileLog.e(t);
+                }
+            });
         } catch (Throwable t) {
             FileLog.e(t);
         }
     }
 
 
-    /** Inject newly received OpenIM messages (WS push or one-shot sync) into TG UI. */
-    private static void injectNewMessagesFromPoll(int account, String me, String peer, long dialogId,
+    /** Inject newly received OpenIM messages (WS push) into TG UI. No polling. */
+    private static void injectNewMessages(int account, String me, String peer, long dialogId,
                                                   OpenIMImClient.ApiResult<List<OpenIMImClient.ChatMessage>> result) {
         if (result == null || !result.ok() || result.data == null || result.data.isEmpty()) {
             return;
@@ -1184,7 +1258,7 @@ public final class KgramTgBridge {
                 d.unread_count = Math.max(0, d.unread_count) + incomingNew;
             }
         } else {
-            // Create a minimal dialog so list can show the peer.
+            // New peer: insert without full-list rebuild (kgramReplaceAllDialogs is janky).
             TLRPC.TL_user user = toUser(peer, peer, null);
             mc.putUser(user, false);
             TLRPC.TL_dialog dialog = new TLRPC.TL_dialog();
@@ -1198,17 +1272,18 @@ public final class KgramTgBridge {
             dialog.read_outbox_max_id = peerHas;
             dialog.notify_settings = new TLRPC.TL_peerNotifySettings();
             mc.dialogs_dict.put(dialogId, dialog);
-            ArrayList<TLRPC.Dialog> all = new ArrayList<>();
-            for (int i = 0; i < mc.getDialogs(0).size(); i++) {
-                all.add(mc.getDialogs(0).get(i));
+            try {
+                ArrayList<TLRPC.Dialog> folder = mc.getDialogs(0);
+                if (folder != null) {
+                    folder.add(dialog);
+                }
+            } catch (Throwable ignore) {
             }
-            all.add(dialog);
-            mc.kgramReplaceAllDialogs(all);
+            scheduleDialogsListRefresh();
         }
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages, dialogId, fresh, false, 0);
-        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
-        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_READ_DIALOG_MESSAGE);
-        // System notification shade for inbound messages when chat is not open / app backgrounded.
+        // Light list row update only — never dialogsNeedReload per message.
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_READ_DIALOG_MESSAGE | MessagesController.UPDATE_MASK_NAME | MessagesController.UPDATE_MASK_MESSAGE_TEXT);
         boolean appForeground = true;
         try {
             ForegroundDetector det = ForegroundDetector.getInstance();
@@ -1218,42 +1293,34 @@ public final class KgramTgBridge {
         } catch (Throwable ignore) {
         }
         boolean chatOpen = Boolean.TRUE.equals(watchedDialogs.get(dialogId));
-        // Hard rule: backgrounded process ALWAYS notifies (Home / multi-task race).
         if (!appForeground) {
             chatOpen = false;
         }
-        Log.e(NOTIFY_TAG, "inject notify gate dialog=" + dialogId
-                + " fresh=" + fresh.size()
-                + " chatOpen=" + chatOpen
-                + " appFg=" + appForeground
-                + " watched=" + watchedDialogs.containsKey(dialogId));
-        if (!chatOpen) {
-            String peerTitle = KgramNotifications.resolvePeerTitle(account, dialogId, peer);
-            ArrayList<MessageObject> inbound = new ArrayList<>();
-            for (MessageObject mo : fresh) {
-                if (mo == null || mo.isOut() || mo.messageOwner == null) {
-                    continue;
-                }
-                inbound.add(mo);
-                String notifPreview = mo.messageOwner.message;
-                Log.e(NOTIFY_TAG, "notify attempt dialog=" + dialogId + " mid=" + mo.getId());
-                FileLog.e("kgram notify attempt dialog=" + dialogId + " mid=" + mo.getId());
-                KgramNotifications.notifyIncoming(account, dialogId, peerTitle, notifPreview, mo.getId());
-            }
-            // Dual path: also feed TG NotificationsController (uses its own channels).
-            if (!inbound.isEmpty()) {
-                try {
-                    org.telegram.messenger.NotificationsController.getInstance(account)
-                            .processNewMessages(inbound, true, false, null);
-                } catch (Throwable t) {
-                    Log.e(NOTIFY_TAG, "processNewMessages failed", t);
-                    FileLog.e(t);
-                }
-            }
-        } else {
+        if (chatOpen) {
             KgramNotifications.cancelDialog(account, dialogId);
+        } else {
+            // Shade notify off the critical UI path.
+            final ArrayList<MessageObject> inbound = new ArrayList<>();
+            for (MessageObject mo : fresh) {
+                if (mo != null && !mo.isOut() && mo.messageOwner != null) {
+                    inbound.add(mo);
+                }
+            }
+            if (!inbound.isEmpty()) {
+                final String peerTitle = KgramNotifications.resolvePeerTitle(account, dialogId, peer);
+                Utilities.globalQueue.postRunnable(() -> {
+                    for (MessageObject mo : inbound) {
+                        try {
+                            String notifPreview = mo.messageOwner != null ? mo.messageOwner.message : "";
+                            KgramNotifications.notifyIncoming(account, dialogId, peerTitle, notifPreview, mo.getId());
+                        } catch (Throwable t) {
+                            FileLog.e(t);
+                        }
+                    }
+                });
+            }
         }
-        FileLog.d("kgram ws inject dialog=" + dialogId + " new=" + fresh.size() + " maxSeq=" + newMax);
+        dlog("kgram ws inject dialog=" + dialogId + " new=" + fresh.size() + " maxSeq=" + newMax);
     }
 
 

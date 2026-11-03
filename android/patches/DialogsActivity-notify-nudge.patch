@@ -3,14 +3,17 @@
 @@
      public void onResume() {
          super.onResume();
-         // kgram: pull/resume refresh must hit OpenIM conversation list, not MTProto.
+-        // kgram: pull/resume refresh must hit OpenIM conversation list, not MTProto.
++        // kgram: no periodic/onResume dialog HTTP poll — realtime is WS; list REST only on pull-to-refresh / login.
          if (folderId == 0 && communityId == 0 && !onlySelect
                  && org.telegram.messenger.kgram.KgramTgBridge.enabled()) {
-             org.telegram.messenger.kgram.KgramTgBridge.forceReloadDialogsOpenIM(currentAccount);
-+            // Keep asking for shade permission until granted (v0.1.14 stuck forever after one miss).
-+            try {
-+                org.telegram.messenger.kgram.KgramNotifications.requestPermissionIfNeeded();
-+                org.telegram.messenger.kgram.KgramPushService.ensureStarted(ApplicationLoader.applicationContext);
-+            } catch (Throwable ignore) {
-+            }
+-            org.telegram.messenger.kgram.KgramTgBridge.forceReloadDialogsOpenIM(currentAccount);
+             try {
+                 org.telegram.messenger.kgram.KgramNotifications.requestPermissionIfNeeded();
+                 org.telegram.messenger.kgram.KgramPushService.ensureStarted(ApplicationLoader.applicationContext);
+             } catch (Throwable ignore) {
+             }
          }
+@@
+-                    org.telegram.messenger.kgram.KgramTgBridge.forceReloadDialogsOpenIM(currentAccount);
++                    org.telegram.messenger.kgram.KgramTgBridge.forceReloadDialogsOpenIM(currentAccount, true);

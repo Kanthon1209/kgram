@@ -35,9 +35,8 @@ public final class KgramServerConfig {
     public static final String OPENIM_ADMIN_USER = "imAdmin";
 
     /**
-     * @deprecated Realtime uses OpenIM WebSocket ({@link OpenIMWebSocket}); kept only for
-     * legacy KgramChatActivity no-op path.
+     * @deprecated Polling removed — realtime is OpenIM WebSocket only.
      */
     @Deprecated
-    public static final int CHAT_POLL_MS = 2000;
+    public static final int CHAT_POLL_MS = 0;
 }

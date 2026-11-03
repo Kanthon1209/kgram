@@ -13,6 +13,7 @@ import com.neovisionaries.ws.client.WebSocketFrame;
 
 import org.json.JSONObject;
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.FileLog;
 
 import java.net.URLEncoder;
@@ -73,12 +74,34 @@ public final class OpenIMWebSocket {
                     ws.sendText("{\"type\":\"ping\"}");
                 }
             } catch (Throwable t) {
-                Log.e(TAG, "ping failed", t);
-                FileLog.e(t);
+                elog("ping failed", t);
             }
             postWorker(this, 15000);
         }
     };
+
+
+    private static void dlog(String msg) {
+        if (BuildVars.LOGS_ENABLED) {
+            Log.d(TAG, msg);
+            FileLog.d(msg);
+        }
+    }
+
+    private static void elog(String msg, Throwable tr) {
+        if (BuildVars.LOGS_ENABLED) {
+            if (tr != null) {
+                Log.e(TAG, msg, tr);
+            } else {
+                Log.e(TAG, msg);
+            }
+        }
+        if (tr != null) {
+            FileLog.e(tr);
+        } else {
+            FileLog.e(msg);
+        }
+    }
 
     private OpenIMWebSocket() {}
 
@@ -88,8 +111,7 @@ public final class OpenIMWebSocket {
 
     public void start(String userID, String imToken) {
         if (userID == null || userID.length() == 0 || imToken == null || imToken.length() == 0) {
-            Log.e(TAG, "start missing creds");
-            FileLog.e("kgram ws start missing creds");
+            elog("start missing creds", null);
             return;
         }
         ensureWorker();
@@ -101,7 +123,7 @@ public final class OpenIMWebSocket {
         }
         cancelWorker(reconnectRunnable);
         postWorker(this::connectInternal, 0);
-        Log.e(TAG, "start requested uid=" + userID);
+        dlog("start requested uid=" + userID);
     }
 
     public void stop() {
@@ -120,7 +142,7 @@ public final class OpenIMWebSocket {
             } catch (Throwable ignore) {
             }
         }
-        Log.e(TAG, "stopped");
+        dlog("stopped");
     }
 
     public boolean isRunning() {
@@ -205,8 +227,7 @@ public final class OpenIMWebSocket {
                     + "&isBackground=" + (isAppBackground() ? "true" : "false")
                     + "&isMsgResp=true"
                     + "&operationID=" + enc(op);
-            Log.e(TAG, "connecting attempt=" + attempt + " bg=" + isAppBackground());
-            FileLog.e("kgram ws connecting attempt=" + attempt);
+            dlog("connecting attempt=" + attempt + " bg=" + isAppBackground());
             WebSocket ws = new WebSocketFactory().setConnectionTimeout(12_000).createSocket(url);
             ws.addListener(new WebSocketAdapter() {
                 @Override
@@ -216,8 +237,7 @@ public final class OpenIMWebSocket {
                             websocket.disconnect();
                             return;
                         }
-                        Log.e(TAG, "connected");
-                        FileLog.e("kgram ws connected");
+                        dlog("connected");
                         backoffMs = 1000;
                         cancelWorker(pingRunnable);
                         postWorker(pingRunnable, 5000);
@@ -255,9 +275,7 @@ public final class OpenIMWebSocket {
                             text = new String(binary, StandardCharsets.UTF_8);
                         }
                     } catch (Exception e) {
-                        Log.e(TAG, "binary decode fail", e);
-                        FileLog.e("kgram ws binary decode fail");
-                        FileLog.e(e);
+                        elog("binary decode fail", e);
                         return;
                     }
                     handlePayload(websocket, attempt, text);
@@ -276,8 +294,7 @@ public final class OpenIMWebSocket {
 
                 @Override
                 public void onError(WebSocket websocket, WebSocketException exception) {
-                    Log.e(TAG, "ws error " + exception);
-                    FileLog.e("kgram ws error " + exception);
+                    elog("ws error " + exception, null);
                 }
             });
             synchronized (lock) {
@@ -285,8 +302,7 @@ public final class OpenIMWebSocket {
             }
             ws.connectAsynchronously();
         } catch (Throwable t) {
-            Log.e(TAG, "create failed", t);
-            FileLog.e(t);
+            elog("create failed", t);
             scheduleReconnect(null, attempt, "create failed");
         }
     }
@@ -310,13 +326,12 @@ public final class OpenIMWebSocket {
                     return;
                 }
                 if (!obj.has("reqIdentifier") && obj.optInt("errCode", 0) == 0 && !obj.has("data")) {
-                    Log.e(TAG, "handshake ok");
+                    dlog("handshake ok");
                     return;
                 }
                 int reqId = obj.optInt("reqIdentifier", 0);
                 if (reqId == WS_KICK) {
-                    Log.e(TAG, "kicked");
-                    FileLog.e("kgram ws kicked");
+                    elog("kicked", null);
                     scheduleReconnect(websocket, attempt, "kicked");
                     return;
                 }
@@ -329,15 +344,14 @@ public final class OpenIMWebSocket {
                 }
                 byte[] raw = Base64.decode(dataB64, Base64.DEFAULT);
                 OpenIMProtoLite.DecodedPush push = OpenIMProtoLite.decodePushMessages(raw);
-                Log.e(TAG, "push msgs=" + push.messages.size() + " receipts=" + push.receipts.size());
-                FileLog.e("kgram ws push msgs=" + push.messages.size() + " receipts=" + push.receipts.size());
+                dlog("push msgs=" + push.messages.size() + " receipts=" + push.receipts.size());
+                // Stay on worker — bridge prepares off-UI and only hops for TG model/notify.
                 Listener l = listener;
                 if (l != null) {
-                    AndroidUtilities.runOnUIThread(() -> l.onPushMessages(push));
+                    l.onPushMessages(push);
                 }
             } catch (Throwable t) {
-                Log.e(TAG, "payload handle failed", t);
-                FileLog.e(t);
+                elog("payload handle failed", t);
             }
         }, 0);
     }
@@ -347,8 +361,7 @@ public final class OpenIMWebSocket {
             if (!running || generation.get() != attempt) {
                 return;
             }
-            Log.e(TAG, "reconnect: " + reason);
-            FileLog.e("kgram ws reconnect: " + reason);
+            dlog("reconnect: " + reason);
             cancelWorker(pingRunnable);
             Listener l = listener;
             if (l != null) {

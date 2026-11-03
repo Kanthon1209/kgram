@@ -27,7 +27,7 @@ import java.util.concurrent.Executors;
 public final class OpenIMImClient {
     private OpenIMImClient() {}
 
-    private static final ExecutorService EXEC = Executors.newCachedThreadPool();
+    private static final ExecutorService EXEC = Executors.newFixedThreadPool(4);
     private static volatile String cachedAdminToken;
     private static volatile long cachedAdminAt;
 

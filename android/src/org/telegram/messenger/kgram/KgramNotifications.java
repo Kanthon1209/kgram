@@ -19,6 +19,7 @@ import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
 
 import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.NotificationsController;
 import org.telegram.messenger.R;
@@ -31,6 +32,12 @@ import org.telegram.ui.LaunchActivity;
  * Does not depend on MTProto NotificationsController pipelines.
  */
 public final class KgramNotifications {
+    private static void dlog(String msg) {
+        if (BuildVars.LOGS_ENABLED) {
+            Log.d(TAG, msg);
+        }
+    }
+
     private KgramNotifications() {}
 
     private static final String TAG = "kgram-notify";
@@ -80,10 +87,10 @@ public final class KgramNotifications {
                 } catch (Throwable ignore) {
                 }
                 nm.createNotificationChannel(ch);
-                Log.e(TAG, "created channel " + CHANNEL_ID + " HIGH");
+                dlog("created channel " + CHANNEL_ID + " HIGH");
             } else if (existing.getImportance() < NotificationManager.IMPORTANCE_DEFAULT) {
                 // Cannot raise importance of an existing channel; recreate under new id next ship.
-                Log.e(TAG, "channel " + CHANNEL_ID + " importance too low=" + existing.getImportance());
+                dlog("channel " + CHANNEL_ID + " importance too low=" + existing.getImportance());
             }
             channelReady = true;
         } catch (Throwable t) {
@@ -129,14 +136,14 @@ public final class KgramNotifications {
         long now = System.currentTimeMillis();
         // Don't spam the system dialog; retry at most every 20s.
         if (now - lastPermissionAskMs < 20_000L) {
-            Log.e(TAG, "permission ask skipped (cooldown)");
+            dlog("permission ask skipped (cooldown)");
             return;
         }
         lastPermissionAskMs = now;
-        Log.e(TAG, "requesting POST_NOTIFICATIONS");
+        dlog("requesting POST_NOTIFICATIONS");
         try {
             PermissionRequest.requestPermission(Manifest.permission.POST_NOTIFICATIONS, granted -> {
-                Log.e(TAG, "POST_NOTIFICATIONS granted=" + granted);
+                dlog("POST_NOTIFICATIONS granted=" + granted);
                 FileLog.e("kgram POST_NOTIFICATIONS granted=" + granted);
                 if (granted) {
                     permissionGrantedSticky = true;
@@ -165,7 +172,7 @@ public final class KgramNotifications {
     public static void postSelfTest(String title, String body) {
         Context ctx = ApplicationLoader.applicationContext;
         if (ctx == null || !canPost(ctx)) {
-            Log.e(TAG, "self-test skipped canPost=" + canPost(ctx));
+            dlog("self-test skipped canPost=" + canPost(ctx));
             return;
         }
         ensureChannel(ctx);
@@ -186,7 +193,7 @@ public final class KgramNotifications {
                     .setContentIntent(pi)
                     .setColor(0xff11acfa);
             postRaw(ctx, TEST_NOTIFY_ID, builder.build());
-            Log.e(TAG, "self-test posted");
+            dlog("self-test posted");
         } catch (Throwable t) {
             // Fallback icon if msg_check_s missing
             try {
@@ -198,7 +205,7 @@ public final class KgramNotifications {
                         .setDefaults(NotificationCompat.DEFAULT_ALL)
                         .setPriority(NotificationCompat.PRIORITY_HIGH);
                 postRaw(ctx, TEST_NOTIFY_ID, builder.build());
-                Log.e(TAG, "self-test posted via notification icon");
+                dlog("self-test posted via notification icon");
             } catch (Throwable t2) {
                 Log.e(TAG, "self-test failed", t2);
             }
@@ -212,22 +219,19 @@ public final class KgramNotifications {
      */
     public static void notifyIncoming(int account, long dialogId, String title, String body, int messageId) {
         Context ctx = ApplicationLoader.applicationContext;
-        Log.e(TAG, "notifyIncoming account=" + account + " dialog=" + dialogId
+        dlog("notifyIncoming account=" + account + " dialog=" + dialogId
                 + " mid=" + messageId + " title=" + title);
         if (ctx == null || dialogId <= 0) {
-            Log.e(TAG, "notify skip: no ctx/dialog");
-            FileLog.e("kgram notify skip: no ctx/dialog");
+            dlog("notify skip: no ctx/dialog");
             return;
         }
         if (!KgramServerConfig.USE_OPENIM_AUTH) {
-            Log.e(TAG, "notify skip: OpenIM auth disabled");
+            dlog("notify skip: OpenIM auth disabled");
             return;
         }
         ensureChannel(ctx);
-        dumpState(ctx);
         if (!canPost(ctx)) {
-            Log.e(TAG, "notify skip: no permission / disabled — requesting");
-            FileLog.e("kgram notify skip: no POST_NOTIFICATIONS / disabled");
+            dlog("notify skip: no permission / disabled — requesting");
             requestPermissionIfNeeded();
             return;
         }
@@ -276,8 +280,7 @@ public final class KgramNotifications {
 
             Notification n = builder.build();
             postRaw(ctx, notifyId, n);
-            Log.e(TAG, "notify posted dialog=" + dialogId + " mid=" + messageId + " id=" + notifyId);
-            FileLog.e("kgram notify posted dialog=" + dialogId + " mid=" + messageId + " id=" + notifyId);
+            dlog("notify posted dialog=" + dialogId + " mid=" + messageId + " id=" + notifyId);
         } catch (Throwable t) {
             Log.e(TAG, "notify failed", t);
             FileLog.e("kgram notify failed");
@@ -313,7 +316,7 @@ public final class KgramNotifications {
                     chInfo = ch == null ? "missing" : ("imp=" + ch.getImportance());
                 }
             }
-            Log.e(TAG, "state enabled=" + enabled + " perm=" + perm
+            dlog("state enabled=" + enabled + " perm=" + perm
                     + " channel=" + CHANNEL_ID + "/" + chInfo
                     + " stickyGranted=" + permissionGrantedSticky
                     + " sdk=" + Build.VERSION.SDK_INT);

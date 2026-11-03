@@ -15,6 +15,7 @@ import android.util.Log;
 import androidx.core.app.NotificationCompat;
 
 import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.R;
 import org.telegram.ui.LaunchActivity;
@@ -38,7 +39,7 @@ public class KgramPushService extends Service {
             return;
         }
         if (!KgramSession.hasSession(ctx)) {
-            Log.e(TAG, "ensureStarted skipped: no session");
+            if (BuildVars.LOGS_ENABLED) Log.d(TAG, "ensureStarted skipped: no session");
             return;
         }
         try {
@@ -49,9 +50,8 @@ public class KgramPushService extends Service {
             } else {
                 ctx.startService(i);
             }
-            Log.e(TAG, "ensureStarted dispatched");
+            if (BuildVars.LOGS_ENABLED) Log.d(TAG, "ensureStarted dispatched");
         } catch (Throwable t) {
-            Log.e(TAG, "ensureStarted failed", t);
             FileLog.e(t);
         }
     }
@@ -81,7 +81,7 @@ public class KgramPushService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        Log.e(TAG, "onCreate");
+        if (BuildVars.LOGS_ENABLED) Log.d(TAG, "onCreate");
         promoteForeground();
         bootBridge();
     }
@@ -89,7 +89,7 @@ public class KgramPushService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent != null ? intent.getAction() : null;
-        Log.e(TAG, "onStartCommand action=" + action);
+        if (BuildVars.LOGS_ENABLED) Log.d(TAG, "onStartCommand action=" + action);
         if (ACTION_STOP.equals(action)) {
             started = false;
             stopForeground(true);
@@ -104,7 +104,7 @@ public class KgramPushService extends Service {
     @Override
     public void onDestroy() {
         started = false;
-        Log.e(TAG, "onDestroy");
+        if (BuildVars.LOGS_ENABLED) Log.d(TAG, "onDestroy");
         super.onDestroy();
         Context ctx = ApplicationLoader.applicationContext;
         if (ctx != null && KgramServerConfig.USE_OPENIM_AUTH && KgramSession.hasSession(ctx)) {
@@ -130,9 +130,8 @@ public class KgramPushService extends Service {
                 startForeground(NOTIFY_ID, n);
             }
             started = true;
-            Log.e(TAG, "startForeground OK");
+            if (BuildVars.LOGS_ENABLED) Log.d(TAG, "startForeground OK");
         } catch (Throwable t) {
-            Log.e(TAG, "startForeground FAILED", t);
             FileLog.e(t);
             // Still try to keep WS even if FGS notification fails.
             started = false;
@@ -145,21 +144,19 @@ public class KgramPushService extends Service {
             if (ApplicationLoader.applicationContext == null) {
                 ApplicationLoader.applicationContext = ctx;
             }
+            // postInitApplication is idempotent (no-ops after first init).
             ApplicationLoader.postInitApplication();
         } catch (Throwable t) {
-            Log.e(TAG, "postInitApplication failed", t);
             FileLog.e(t);
         }
         try {
+            OpenIMWebSocket ws = OpenIMWebSocket.getInstance();
+            if (started && ws.isRunning() && ws.isConnected()) {
+                return;
+            }
             KgramNotifications.ensureChannel(getApplicationContext());
             KgramTgBridge.ensurePushRuntime();
-            if (KgramSession.hasSession(getApplicationContext())) {
-                OpenIMWebSocket ws = OpenIMWebSocket.getInstance();
-                Log.e(TAG, "bootBridge WS running=" + ws.isRunning()
-                        + " connected=" + ws.isConnected());
-            }
         } catch (Throwable t) {
-            Log.e(TAG, "bootBridge failed", t);
             FileLog.e(t);
         }
     }
