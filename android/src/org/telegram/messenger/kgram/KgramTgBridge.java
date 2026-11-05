@@ -140,12 +140,153 @@ public final class KgramTgBridge {
         uc.saveConfig(true);
         MessagesController.getInstance(account).putUser(user, false);
         FileLog.d("kgram bridge activated userId=" + myId);
+        // Pull latest nickname/faceURL from OpenIM (non-blocking).
+        refreshSelfProfileFromOpenIM(account);
         // Warm dialogs + contacts immediately after login.
         loadDialogsOpenIM(account, 0, true);
         loadContactsOpenIM(account);
         ensureWebSocket();
         ensurePushRuntime();
         AndroidUtilities.runOnUIThread(KgramNotifications::requestPermissionIfNeeded, 800);
+    }
+
+
+    public interface BoolCallback {
+        void onDone(boolean ok);
+    }
+
+    /** Sync nickname to OpenIM + local UserConfig/KgramSession. */
+    public static boolean updateSelfNickname(final int account, final String nickname, final BoolCallback cb) {
+        Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
+        if (!enabled(ctx)) {
+            return false;
+        }
+        final String me = KgramSession.userID(ctx);
+        final String token = KgramSession.imToken(ctx);
+        final String nick = nickname != null ? nickname.trim() : "";
+        if (nick.length() == 0) {
+            if (cb != null) cb.onDone(false);
+            return true;
+        }
+        // Optimistic local apply
+        applyLocalSelfName(account, nick);
+        OpenIMImClient.updateUserInfoAsync(me, nick, null, token, result -> AndroidUtilities.runOnUIThread(() -> {
+            boolean ok = result != null && result.ok();
+            if (ok) {
+                KgramSession.updateNickname(ctx, nick);
+            }
+            FileLog.d("kgram update nickname ok=" + ok + " err=" + (result != null ? result.errMsg : "null"));
+            if (cb != null) cb.onDone(ok);
+        }));
+        return true;
+    }
+
+    /** Upload local avatar file → OpenIM object store → update_user_info(faceURL). */
+    public static boolean uploadSelfAvatar(final int account, final String localPath,
+                                           final TLRPC.PhotoSize bigSize, final TLRPC.PhotoSize smallSize,
+                                           final BoolCallback cb) {
+        Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
+        if (!enabled(ctx) || localPath == null || localPath.length() == 0) {
+            if (cb != null) AndroidUtilities.runOnUIThread(() -> cb.onDone(false));
+            return false;
+        }
+        final String me = KgramSession.userID(ctx);
+        final String token = KgramSession.imToken(ctx);
+        final java.io.File file = new java.io.File(localPath);
+        // Keep local preview on UserConfig immediately so UI stays consistent after upload.
+        applyLocalSelfAvatar(account, bigSize, smallSize);
+        OpenIMImClient.uploadAvatarAsync(file, me, token, up -> {
+            if (up == null || !up.ok() || up.data == null || up.data.length() == 0) {
+                FileLog.e("kgram avatar upload failed: " + (up != null ? up.errCode + " " + up.errMsg + " " + up.errDlt : "null"));
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (cb != null) cb.onDone(false);
+                });
+                return;
+            }
+            final String faceURL = up.data;
+            OpenIMImClient.updateUserInfoAsync(me, null, faceURL, token, upd -> AndroidUtilities.runOnUIThread(() -> {
+                boolean ok = upd != null && upd.ok();
+                if (ok) {
+                    KgramSession.updateFaceURL(ctx, faceURL);
+                    applyLocalSelfAvatar(account, bigSize, smallSize);
+                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.mainUserInfoChanged);
+                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_AVATAR | MessagesController.UPDATE_MASK_NAME);
+                }
+                FileLog.d("kgram avatar faceURL=" + faceURL + " updateOk=" + ok);
+                if (cb != null) cb.onDone(ok);
+            }));
+        });
+        return true;
+    }
+
+    public static void refreshSelfProfileFromOpenIM(final int account) {
+        Context ctx = org.telegram.messenger.ApplicationLoader.applicationContext;
+        if (!enabled(ctx)) {
+            return;
+        }
+        final String me = KgramSession.userID(ctx);
+        final String token = KgramSession.imToken(ctx);
+        java.util.ArrayList<String> ids = new java.util.ArrayList<>();
+        ids.add(me);
+        OpenIMImClient.getUsersInfoAsync(ids, token, result -> AndroidUtilities.runOnUIThread(() -> {
+            if (result == null || !result.ok() || result.data == null || result.data.isEmpty()) {
+                return;
+            }
+            OpenIMImClient.UserInfo u = result.data.get(0);
+            if (u == null) return;
+            if (u.nickname != null && u.nickname.length() > 0) {
+                KgramSession.updateNickname(ctx, u.nickname);
+                applyLocalSelfName(account, u.nickname);
+            }
+            if (u.faceURL != null && u.faceURL.length() > 0) {
+                KgramSession.updateFaceURL(ctx, u.faceURL);
+            }
+            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.mainUserInfoChanged);
+            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_NAME | MessagesController.UPDATE_MASK_AVATAR);
+        }));
+    }
+
+    private static void applyLocalSelfName(int account, String nick) {
+        UserConfig uc = UserConfig.getInstance(account);
+        TLRPC.User cur = uc.getCurrentUser();
+        if (cur != null) {
+            cur.first_name = nick;
+            cur.last_name = "";
+            uc.setCurrentUser(cur);
+            uc.saveConfig(true);
+        }
+        TLRPC.User cached = MessagesController.getInstance(account).getUser(uc.getClientUserId());
+        if (cached != null) {
+            cached.first_name = nick;
+            cached.last_name = "";
+        }
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.mainUserInfoChanged);
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_NAME);
+    }
+
+    private static void applyLocalSelfAvatar(int account, TLRPC.PhotoSize bigSize, TLRPC.PhotoSize smallSize) {
+        if (bigSize == null && smallSize == null) {
+            return;
+        }
+        UserConfig uc = UserConfig.getInstance(account);
+        TLRPC.User user = uc.getCurrentUser();
+        if (user == null) {
+            user = MessagesController.getInstance(account).getUser(uc.getClientUserId());
+        }
+        if (user == null) {
+            return;
+        }
+        user.photo = new TLRPC.TL_userProfilePhoto();
+        user.photo.photo_id = 1;
+        if (smallSize != null && smallSize.location != null) {
+            user.photo.photo_small = smallSize.location;
+        }
+        if (bigSize != null && bigSize.location != null) {
+            user.photo.photo_big = bigSize.location;
+        }
+        uc.setCurrentUser(user);
+        uc.saveConfig(true);
+        MessagesController.getInstance(account).putUser(user, false);
     }
 
     public static void clearActivation() {
@@ -688,16 +829,32 @@ public final class KgramTgBridge {
                         }
                     }
                     // isEnd only when we reached seq 1 / empty older page — keeps pagination alive.
+                    // Older history is OpenIM REST (pull_msg_by_seq / beforeSeq), NEVER a WS frame.
                     boolean isEnd;
                     if (!result.ok()) {
-                        isEnd = false;
+                        isEnd = false; // allow scroll-up retry on transient API errors
                     } else if (built.isEmpty()) {
-                        isEnd = !initial; // older page empty → end; initial empty → still end-ish for UI
-                        if (initial) isEnd = true;
+                        isEnd = true; // empty initial or empty older page → no older to fetch
                     } else {
                         isEnd = minSeq <= 1;
                     }
-                    mc.processLoadedMessages(res, res.messages.size(), dialogId, 0, count, max_id, 0, false, classGuid,
+                    // ChatActivity seals endReached when messArr.size() < count. Pass a synthetic
+                    // count so short OpenIM pages (filtered contentType!=101) do not freeze pagination
+                    // while isEnd is still false; when isEnd, force size < count so UI seals cleanly.
+                    final int endCheckCount;
+                    if (!result.ok()) {
+                        endCheckCount = 0; // 0 < 0 is false → do not seal on error
+                    } else if (isEnd) {
+                        endCheckCount = built.size() + 1;
+                    } else {
+                        endCheckCount = built.size(); // equal → not end
+                    }
+                    FileLog.d("kgram hist dialog=" + dialogId + " initial=" + initial
+                            + " max_id=" + max_id + " beforeSeq=" + beforeSeq
+                            + " n=" + built.size() + " minSeq=" + (minSeq == Long.MAX_VALUE ? 0 : minSeq)
+                            + " maxSeq=" + maxSeq + " isEnd=" + isEnd
+                            + " endCheckCount=" + endCheckCount + " load_type=" + load_type);
+                    mc.processLoadedMessages(res, res.messages.size(), dialogId, 0, endCheckCount, max_id, 0, false, classGuid,
                             0, last_message_id, 0, 0, load_type, isEnd, mode, 0, loadIndex, false, 0, true, false, null);
                     if (initial && maxSeq > 0 && Boolean.TRUE.equals(watchedDialogs.get(dialogId))) {
                         markConversationReadOpenIM(me, peer, maxSeq, token);

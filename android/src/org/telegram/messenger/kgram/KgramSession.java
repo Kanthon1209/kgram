@@ -40,6 +40,19 @@ public final class KgramSession {
         return prefs(ctx).getString("phoneNumber", "");
     }
 
+    public static String faceURL(Context ctx) {
+        String u = prefs(ctx).getString("faceURL", "");
+        return u != null ? u : "";
+    }
+
+    public static void updateNickname(Context ctx, String nickname) {
+        prefs(ctx).edit().putString("nickname", nickname != null ? nickname : "").apply();
+    }
+
+    public static void updateFaceURL(Context ctx, String faceURL) {
+        prefs(ctx).edit().putString("faceURL", faceURL != null ? faceURL : "").apply();
+    }
+
     public static void save(Context ctx, String areaCode, String phoneNumber, String nickname,
                             String userID, String imToken, String chatToken) {
         prefs(ctx).edit()
@@ -49,6 +62,7 @@ public final class KgramSession {
                 .putString("areaCode", areaCode != null ? areaCode : "")
                 .putString("phoneNumber", phoneNumber != null ? phoneNumber : "")
                 .putString("nickname", nickname != null ? nickname : "")
+                .putString("faceURL", "")
                 .putString("imApi", KgramServerConfig.IM_API)
                 .putString("imWs", KgramServerConfig.IM_WS)
                 .putString("chatApi", KgramServerConfig.CHAT_API)

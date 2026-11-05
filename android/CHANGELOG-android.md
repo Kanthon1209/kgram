@@ -1,3 +1,8 @@
+## v0.1.20 — hist load-more + profile nickname/avatar (2026-11-05 Asia/Shanghai)
+
+- Fix chat scroll-up not loading older messages (REST beforeSeq pagination; WS is realtime only).
+- Wire nickname + avatar to OpenIM (`update_user_info` + object upload → faceURL).
+
 ## v0.1.14-sysnotify-fgs-debug
 - Root-cause fix: markDialogAsRead no longer re-arms watchedDialogs after Home (was suppressing shade)
 - KgramPushService FGS (dataSync) keeps OpenIM WS alive in background; quiet keepalive notification

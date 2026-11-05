@@ -1,0 +1,29 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/ImageUpdater.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/ImageUpdater.java
+index 2e1c5a2..b751700 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/ImageUpdater.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/ImageUpdater.java
+@@ -899,11 +899,19 @@ public class ImageUpdater implements NotificationCenter.NotificationCenterDelega
+                     }
+                     isVideo = false;
+                 }
+-                NotificationCenter.getInstance(currentAccount).addObserver(ImageUpdater.this, NotificationCenter.fileUploaded);
+-                NotificationCenter.getInstance(currentAccount).addObserver(ImageUpdater.this, NotificationCenter.fileUploadProgressChanged);
+-                NotificationCenter.getInstance(currentAccount).addObserver(ImageUpdater.this, NotificationCenter.fileUploadFailed);
+-                if (uploadingImage != null) {
+-                    FileLoader.getInstance(currentAccount).uploadFile(uploadingImage, false, true, ConnectionsManager.FileTypePhoto);
++                // kgram OpenIM: do not upload avatar bytes to Telegram DC — ProfileActivity
++                // preview callback (didUploadPhoto null InputFile) kicks OpenIM object upload.
++                boolean openImAvatar = org.telegram.messenger.kgram.KgramServerConfig.USE_OPENIM_AUTH
++                        && org.telegram.messenger.kgram.KgramSession.hasSession(org.telegram.messenger.ApplicationLoader.applicationContext);
++                if (!openImAvatar) {
++                    NotificationCenter.getInstance(currentAccount).addObserver(ImageUpdater.this, NotificationCenter.fileUploaded);
++                    NotificationCenter.getInstance(currentAccount).addObserver(ImageUpdater.this, NotificationCenter.fileUploadProgressChanged);
++                    NotificationCenter.getInstance(currentAccount).addObserver(ImageUpdater.this, NotificationCenter.fileUploadFailed);
++                    if (uploadingImage != null) {
++                        FileLoader.getInstance(currentAccount).uploadFile(uploadingImage, false, true, ConnectionsManager.FileTypePhoto);
++                    }
++                } else {
++                    uploadingImage = null; // prevent stuck isUploadingImage(); OpenIM path owns progress
+                 }
+             }
+             if (delegate != null) {

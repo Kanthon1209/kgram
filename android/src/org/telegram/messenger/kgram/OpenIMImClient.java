@@ -6,6 +6,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.security.MessageDigest;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -729,6 +732,276 @@ public final class OpenIMImClient {
         body.put("hasReadSeq", hasReadSeq);
         Raw raw = post(KgramServerConfig.IM_API + "/msg/mark_conversation_as_read", body, imToken);
         return new ApiResult<>(raw.errCode, raw.errMsg, raw.errDlt, raw.errCode == 0, raw.raw);
+    }
+
+
+    public static void updateUserInfoAsync(String userID, String nickname, String faceURL, String imToken,
+                                           Callback<Boolean> cb) {
+        EXEC.execute(() -> {
+            try {
+                cb.onDone(updateUserInfo(userID, nickname, faceURL, imToken));
+            } catch (Exception e) {
+                cb.onDone(new ApiResult<>(-1, e.getMessage(), "", false, null));
+            }
+        });
+    }
+
+    /** POST /user/update_user_info — nickname and/or faceURL (null keeps server value if omitted empty). */
+    public static ApiResult<Boolean> updateUserInfo(String userID, String nickname, String faceURL, String imToken) throws Exception {
+        JSONObject userInfo = new JSONObject();
+        userInfo.put("userID", userID);
+        if (nickname != null) {
+            userInfo.put("nickname", nickname);
+        }
+        if (faceURL != null) {
+            userInfo.put("faceURL", faceURL);
+        }
+        JSONObject body = new JSONObject();
+        body.put("userInfo", userInfo);
+        Raw raw = post(KgramServerConfig.IM_API + "/user/update_user_info", body, imToken);
+        return new ApiResult<>(raw.errCode, raw.errMsg, raw.errDlt, raw.errCode == 0, raw.raw);
+    }
+
+    public static void uploadAvatarAsync(File file, String userID, String imToken, Callback<String> cb) {
+        EXEC.execute(() -> {
+            try {
+                cb.onDone(uploadAvatar(file, userID, imToken));
+            } catch (Exception e) {
+                cb.onDone(new ApiResult<>(-1, e.getMessage(), "", null, null));
+            }
+        });
+    }
+
+    /**
+     * Upload avatar via OpenIM object form-data API, returns public faceURL.
+     * Falls back to single-part multipart if form-data is unavailable.
+     */
+    public static ApiResult<String> uploadAvatar(File file, String userID, String imToken) throws Exception {
+        if (file == null || !file.exists() || file.length() <= 0) {
+            return new ApiResult<>(-1, "missing file", "", null, null);
+        }
+        String name = (userID != null ? userID : "user") + "/avatar_" + System.currentTimeMillis() + ".jpg";
+        String contentType = "image/jpeg";
+        ApiResult<String> form = uploadViaFormData(file, name, contentType, imToken);
+        if (form.ok() && form.data != null && form.data.length() > 0) {
+            return form;
+        }
+        ApiResult<String> multi = uploadViaMultipart(file, name, contentType, imToken);
+        if (multi.ok()) {
+            return multi;
+        }
+        return form.errCode != 0 ? form : multi;
+    }
+
+    private static ApiResult<String> uploadViaFormData(File file, String name, String contentType, String imToken) throws Exception {
+        JSONObject body = new JSONObject();
+        body.put("name", name);
+        body.put("size", file.length());
+        body.put("contentType", contentType);
+        Raw init = post(KgramServerConfig.IM_API + "/object/initiate_form_data", body, imToken);
+        if (init.errCode != 0 || init.data == null) {
+            return new ApiResult<>(init.errCode, init.errMsg, init.errDlt, null, init.raw);
+        }
+        String id = init.data.optString("id");
+        String uploadUrl = init.data.optString("url");
+        String fileField = init.data.optString("file", "file");
+        JSONObject formData = init.data.optJSONObject("formData");
+        if (uploadUrl == null || uploadUrl.length() == 0) {
+            return new ApiResult<>(-1, "no form upload url", init.errDlt, null, init.raw);
+        }
+        String boundary = "----kgram" + UUID.randomUUID().toString().replace("-", "");
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(uploadUrl).openConnection();
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(60000);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+            if (init.data.optJSONArray("header") != null) {
+                // header is repeated KeyValues in proto; JSON often [{key,value}] or map — skip if unknown shape
+            }
+            OutputStream os = conn.getOutputStream();
+            if (formData != null) {
+                JSONArray keys = formData.names();
+                if (keys != null) {
+                    for (int i = 0; i < keys.length(); i++) {
+                        String k = keys.getString(i);
+                        String v = formData.optString(k);
+                        writeFormField(os, boundary, k, v);
+                    }
+                }
+            }
+            writeFormFile(os, boundary, fileField, file.getName(), contentType, file);
+            os.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+            os.flush();
+            os.close();
+            int code = conn.getResponseCode();
+            InputStream is = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            String resp = is != null ? readAll(is) : "";
+            boolean okCode = code >= 200 && code < 300;
+            JSONArray successCodes = init.data.optJSONArray("successCodes");
+            if (successCodes != null) {
+                okCode = false;
+                for (int i = 0; i < successCodes.length(); i++) {
+                    if (successCodes.optInt(i) == code) {
+                        okCode = true;
+                        break;
+                    }
+                }
+            }
+            if (!okCode) {
+                return new ApiResult<>(code, "form upload HTTP " + code, resp, null, resp);
+            }
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+        JSONObject completeBody = new JSONObject();
+        completeBody.put("id", id);
+        Raw done = post(KgramServerConfig.IM_API + "/object/complete_form_data", completeBody, imToken);
+        if (done.errCode != 0 || done.data == null) {
+            return new ApiResult<>(done.errCode, done.errMsg, done.errDlt, null, done.raw);
+        }
+        String url = done.data.optString("url");
+        return new ApiResult<>(0, "", "", url, done.raw);
+    }
+
+    private static ApiResult<String> uploadViaMultipart(File file, String name, String contentType, String imToken) throws Exception {
+        byte[] bytes = readFileBytes(file);
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        byte[] dig = md.digest(bytes);
+        StringBuilder hex = new StringBuilder();
+        for (byte b : dig) hex.append(String.format("%02x", b));
+        String partMd5 = hex.toString(); // hex(md5(content)) for the single part
+        // OpenIM initiate hash = md5(join(partMd5s, ","))
+        MessageDigest md2 = MessageDigest.getInstance("MD5");
+        byte[] dig2 = md2.digest(partMd5.getBytes(StandardCharsets.UTF_8));
+        StringBuilder hex2 = new StringBuilder();
+        for (byte b : dig2) hex2.append(String.format("%02x", b));
+        String hash = hex2.toString();
+        long partSize = Math.max(bytes.length, 1);
+        JSONObject initBody = new JSONObject();
+        initBody.put("hash", hash);
+        initBody.put("size", (long) bytes.length);
+        initBody.put("partSize", partSize);
+        initBody.put("maxParts", 1);
+        initBody.put("cause", "avatar");
+        initBody.put("name", name);
+        initBody.put("contentType", contentType);
+        Raw init = post(KgramServerConfig.IM_API + "/object/initiate_multipart_upload", initBody, imToken);
+        if (init.errCode != 0 || init.data == null) {
+            return new ApiResult<>(init.errCode, init.errMsg, init.errDlt, null, init.raw);
+        }
+        String existing = init.data.optString("url");
+        JSONObject upload = init.data.optJSONObject("upload");
+        if (upload == null) {
+            return new ApiResult<>(0, "", "", existing, init.raw);
+        }
+        String uploadID = upload.optString("uploadID");
+        // Prefer sign from initiate; else auth_sign
+        String putUrl = null;
+        JSONObject signObj = upload.optJSONObject("sign");
+        if (signObj != null) {
+            JSONArray signParts = signObj.optJSONArray("parts");
+            if (signParts != null && signParts.length() > 0) {
+                putUrl = signParts.getJSONObject(0).optString("url");
+            }
+            if (putUrl == null || putUrl.length() == 0) {
+                putUrl = signObj.optString("url");
+            }
+        }
+        if (putUrl == null || putUrl.length() == 0) {
+            JSONObject signBody = new JSONObject();
+            signBody.put("uploadID", uploadID);
+            JSONArray partNums = new JSONArray();
+            partNums.put(1);
+            signBody.put("partNumbers", partNums);
+            Raw sign = post(KgramServerConfig.IM_API + "/object/auth_sign", signBody, imToken);
+            if (sign.errCode != 0 || sign.data == null) {
+                return new ApiResult<>(sign.errCode, sign.errMsg, sign.errDlt, null, sign.raw);
+            }
+            JSONArray signParts = sign.data.optJSONArray("parts");
+            if (signParts != null && signParts.length() > 0) {
+                putUrl = signParts.getJSONObject(0).optString("url");
+            }
+            if (putUrl == null || putUrl.length() == 0) {
+                putUrl = sign.data.optString("url");
+            }
+        }
+        if (putUrl == null || putUrl.length() == 0) {
+            return new ApiResult<>(-1, "no put url", "", null, init.raw);
+        }
+        HttpURLConnection put = null;
+        try {
+            put = (HttpURLConnection) new URL(putUrl).openConnection();
+            put.setConnectTimeout(20000);
+            put.setReadTimeout(60000);
+            put.setRequestMethod("PUT");
+            put.setDoOutput(true);
+            put.setRequestProperty("Content-Type", contentType);
+            put.setFixedLengthStreamingMode(bytes.length);
+            OutputStream os = put.getOutputStream();
+            os.write(bytes);
+            os.flush();
+            os.close();
+            int code = put.getResponseCode();
+            if (code < 200 || code >= 300) {
+                InputStream es = put.getErrorStream();
+                String err = es != null ? readAll(es) : "";
+                return new ApiResult<>(code, "PUT part failed", err, null, err);
+            }
+        } finally {
+            if (put != null) put.disconnect();
+        }
+        JSONObject complete = new JSONObject();
+        complete.put("uploadID", uploadID);
+        JSONArray partMd5s = new JSONArray();
+        partMd5s.put(partMd5);
+        complete.put("parts", partMd5s);
+        complete.put("name", name);
+        complete.put("contentType", contentType);
+        complete.put("cause", "avatar");
+        Raw done = post(KgramServerConfig.IM_API + "/object/complete_multipart_upload", complete, imToken);
+        if (done.errCode != 0 || done.data == null) {
+            return new ApiResult<>(done.errCode, done.errMsg, done.errDlt, null, done.raw);
+        }
+        return new ApiResult<>(0, "", "", done.data.optString("url"), done.raw);
+    }
+
+    private static void writeFormField(OutputStream os, String boundary, String name, String value) throws Exception {
+        String part = "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n"
+                + (value != null ? value : "") + "\r\n";
+        os.write(part.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void writeFormFile(OutputStream os, String boundary, String field, String filename,
+                                      String contentType, File file) throws Exception {
+        String head = "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"" + field + "\"; filename=\"" + filename + "\"\r\n"
+                + "Content-Type: " + contentType + "\r\n\r\n";
+        os.write(head.getBytes(StandardCharsets.UTF_8));
+        FileInputStream fis = new FileInputStream(file);
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = fis.read(buf)) > 0) {
+            os.write(buf, 0, n);
+        }
+        fis.close();
+        os.write("\r\n".getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static byte[] readFileBytes(File file) throws Exception {
+        FileInputStream fis = new FileInputStream(file);
+        byte[] buf = new byte[(int) file.length()];
+        int off = 0;
+        while (off < buf.length) {
+            int n = fis.read(buf, off, buf.length - off);
+            if (n < 0) break;
+            off += n;
+        }
+        fis.close();
+        return buf;
     }
 
     private static synchronized String getAdminToken() throws Exception {
