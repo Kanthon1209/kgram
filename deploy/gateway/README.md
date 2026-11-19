@@ -3,15 +3,13 @@
 本目录描述如何把 `services/gateway` 放到 OpenIM 同一台机器上，并对外提供 HTTPS / WSS。  
 **不要改动、重启或停止正在运行的 OpenIM / Delve 调试进程。** 网关是一个新进程，只访问已有的 OpenIM HTTP/WS 端口。
 
-当前演示 ECS（Aliyun Hangzhou，`8.136.150.149`）上：
+当前演示 ECS（Aliyun Hangzhou，`8.136.150.149`）：
 
-- 没有已配置的公网域名，没有 nginx / Caddy / Let’s Encrypt 证书，没有 80/443 监听。
-- OpenIM 仍在 `10001/10002/10005/10008/10009` 上以明文 HTTP/WS 对外。这些端口暂时保留给运维和过渡，客户端新版本应只连网关。
-- 机器内存约 2Gi，**不要在这台机器上 `docker build` 或拉很大的镜像。**
+- 没有公网域名。演示 TLS 使用**自签 CA + 服务器证书**（SAN = `IP:8.136.150.149`），Android 钉扎 CA 公钥。
+- OpenIM 仍在 `10001/10002/10005/10008/10009` 上以明文 HTTP/WS 对外，这些端口保持不动，仅供运维和过渡。
+- **不要在这台机器上 `docker build` 或编译大型产物。** 网关二进制在开发机交叉编译后拷过来，用 systemd 运行。
 
-因此本里程碑**默认不在 ECS 上启用在线 TLS**。需要先准备证书，并在安全组放行 `8443`（或 443），再按下面步骤启动。没有这一步，新客户端里的 `https://` / `wss://` 还连不上。
-
-## 1. 编译（在开发机，不要在 2Gi ECS 上）
+## 1. 编译（在开发机）
 
 ```bash
 cd services/gateway
@@ -19,65 +17,63 @@ go test ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o kgram-gateway .
 ```
 
-把二进制拷到服务器，例如 `/opt/kgram/gateway/kgram-gateway`。
+把二进制拷到服务器 `/opt/kgram/gateway/kgram-gateway`。
 
 ## 2. 配置（环境变量，不要入库）
 
 ```bash
 cp deploy/gateway/.env.example /opt/kgram/gateway/.env
-# 编辑 .env：填写 OPENIM_SECRET（与 OpenIM 服务器配置相同，不要写进 git / PR）
-chmod 600 /opt/kgram/gateway/.env
+# 填写 OPENIM_SECRET（与 OpenIM 服务器配置相同，不要写进 git / PR）
+chmod 640 /opt/kgram/gateway/.env
 ```
 
-内网地址用 `http://127.0.0.1:10002` 等即可，不必再把管理员口令暴露到公网。
+内网地址用 `http://127.0.0.1:10002` 等即可。
 
-## 3. TLS 证书
-
-### 方案 A：有公网域名（推荐）
-
-把域名解析到这台机器，申请 Let’s Encrypt（可用 `Caddyfile.example` 在 443 反代 `127.0.0.1:8080`），Android 走系统 CA，无需钉扎。
-
-### 方案 B：暂无域名，自签 + 钉扎（仅演示）
-
-在开发机生成（把 IP 换成实际地址），**只把公钥放到客户端仓库**：
+建议的对外 TLS 环境变量：
 
 ```bash
-openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-  -keyout gateway-key.pem -out gateway-cert.pem \
-  -subj "/CN=8.136.150.149" \
-  -addext "subjectAltName=IP:8.136.150.149"
-```
-
-- `gateway-key.pem` 只放服务器 `/etc/kgram/tls/`，权限 600，不进 git。
-- `gateway-cert.pem` 拷到 Telegram-Android 的 `TMessagesProj/src/main/res/raw/kgram_demo_ca.pem`，并在 `network_security_config.xml` 的对应 domain-config 中增加：
-
-  ```xml
-  <certificates src="@raw/kgram_demo_ca" />
-  ```
-
-然后设置：
-
-```bash
+GATEWAY_ADDR=127.0.0.1:8080
 GATEWAY_TLS_ADDR=:8443
-GATEWAY_TLS_CERT_FILE=/etc/kgram/tls/gateway-cert.pem
+GATEWAY_TLS_CERT_FILE=/etc/kgram/tls/gateway-chain.pem
 GATEWAY_TLS_KEY_FILE=/etc/kgram/tls/gateway-key.pem
 GATEWAY_PUBLIC_URL=https://8.136.150.149:8443
 ```
 
-Aliyun 安全组需要放行 TCP **8443**（或你改用的 443）。
+`gateway-chain.pem` 是叶子证书 + CA，便于客户端用钉扎的 CA 校验。私钥权限 640，属主 `root:kgram`，不进 git。CA 私钥只留在开发机，不要拷到 ECS。
 
-## 4. 启动
+## 3. TLS 证书
+
+### 方案 A：有公网域名（推荐，日后切换）
+
+把域名解析到这台机器，申请 Let’s Encrypt（可用 `Caddyfile.example` 在 443 反代 `127.0.0.1:8080`），Android 走系统 CA。
+
+### 方案 B：当前演示 — 自签 CA + 钉扎
+
+在开发机生成独立 CA，再签发带 `subjectAltName=IP:8.136.150.149` 的服务器证书。**只把 CA 公钥**放到 Android：
+
+- `TMessagesProj/src/main/res/raw/kgram_demo_ca.pem`
+- `network_security_config.xml` 中该 IP 的 domain-config 增加 `<certificates src="@raw/kgram_demo_ca" />`
+
+不要把任何私钥提交进 git。演示证书大约有效至 2029-02-21（UTC）。轮换时需要同时更新 Android 钉扎的 CA 公钥并重签服务器证书。
+
+Aliyun 安全组需要放行 TCP **8443**。机器上的 host firewall（ufw/iptables/firewalld）默认未拦截；若公网仍连不上，多半是安全组未放行。
+
+## 4. 用 systemd 启动
+
+单元文件见同目录 `kgram-gateway.service`。
 
 ```bash
-cd /opt/kgram/gateway
-set -a && . ./.env && set +a
-./kgram-gateway
+# 在服务器上创建系统用户 kgram，安装二进制、证书与单元，然后：
+systemctl daemon-reload
+systemctl enable --now kgram-gateway
+systemctl status kgram-gateway --no-pager
 ```
 
-可用 systemd 托管。确认：
+确认（不要用会打印敏感头的方式）：
 
 ```bash
-curl -s http://127.0.0.1:8080/health
+curl -s --cacert /etc/kgram/tls/ca-cert.pem https://8.136.150.149:8443/health
+# 本机环回可用 -k，因为证书 SAN 只有公网 IP：
 curl -sk https://127.0.0.1:8443/health
 ```
 
@@ -95,4 +91,4 @@ curl -sk https://127.0.0.1:8443/health
 | `IM_WS` | `wss://HOST:8443/v1/ws` |
 | `GATEWAY_API` | `https://HOST:8443` |
 
-完成 TLS 与安全组之前，旧的明文端口仍然可用，但新客户端不应再默认走明文。
+未在安全组放行 8443、或未部署本网关之前，新客户端无法登录演示环境。
