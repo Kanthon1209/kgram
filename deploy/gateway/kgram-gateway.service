@@ -1,0 +1,22 @@
+[Unit]
+Description=kgram HTTPS/WSS gateway (OpenIM user-scoped proxy)
+Documentation=https://github.com/Kanthon1209/kgram/blob/main/deploy/gateway/README.md
+After=network-online.target
+Wants=network-online.target
+# Standalone process. Do not bind this unit to OpenIM/Docker restarts.
+
+[Service]
+Type=simple
+User=kgram
+Group=kgram
+WorkingDirectory=/opt/kgram/gateway
+EnvironmentFile=/opt/kgram/gateway/.env
+ExecStart=/opt/kgram/gateway/kgram-gateway
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

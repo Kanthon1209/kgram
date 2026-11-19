@@ -22,3 +22,12 @@
 ## 网关
 
 - **Go 网关** 首责：**签发 LiveKit 房间 JWT**；后续扩展统一鉴权、OpenIM 与 LiveKit 之间的桥接逻辑。
+
+## 安全底座（2026-11-19）
+
+- 客户端 **不得** 持有 OpenIM 管理员 secret，也不得申请 admin token 或直接调用管理员接口（`send_msg`、`import_friend`、`get_users` 等）。
+- 需要管理员身份的操作（当前仅 REST 发消息，以及在用户是会话参与者的前提下代查对端 hasReadSeq）只允许由 **kgram 网关** 在服务端完成；网关先用用户自己的 IM token 鉴权，并将操作主体强制为该用户。
+- 加好友走官方用户接口 `/friend/add_friend`（申请），**不**再使用 admin `import_friend` 双边强制成为好友。
+- 通讯录只使用当前用户的好友列表，不提供「列出服务器全部用户」的客户端或网关接口。
+- 客户端默认使用 HTTPS / WSS 访问 Chat、IM、对象存储与长连接。WebSocket 的 token 放在请求头或连接后的 auth 帧，不得出现在 URL query。
+- 管理员凭证只通过服务器环境变量配置，不进入 git。
