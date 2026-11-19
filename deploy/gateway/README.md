@@ -9,6 +9,13 @@
 - OpenIM 仍在 `10001/10002/10005/10008/10009` 上以明文 HTTP/WS 对外，这些端口保持不动，仅供运维和过渡。
 - **不要在这台机器上 `docker build` 或编译大型产物。** 网关二进制在开发机交叉编译后拷过来，用 systemd 运行。
 
+### 当前演示状态（2026-11-19 Asia/Shanghai）
+
+- systemd 服务 `kgram-gateway` 已在 ECS 上启用并运行（用户 `kgram`）。
+- 进程监听 `0.0.0.0:8443`（HTTPS）和 `127.0.0.1:8080`（仅本机 HTTP）。本机 `https://127.0.0.1:8443/health` 与 `http://127.0.0.1:8080/health` 返回 `{"status":"ok","service":"kgram-gateway"}`。
+- 服务器证书 SAN = `IP:8.136.150.149`，由「kgram demo CA」签发，有效期至 2029-02-21 22:17（Asia/Shanghai）。Android 已钉扎 CA 公钥（`res/raw/kgram_demo_ca.pem`）。
+- 主机防火墙（ufw/iptables/firewalld）未拦截 8443。从公网探测 TCP 8443 **超时**，而同一来源可以连上已放行的 22 和 10002。因此还需要在 **Aliyun 安全组放行 TCP 8443**，新客户端才能连上。OpenIM 原有明文端口未改动。
+
 ## 1. 编译（在开发机）
 
 ```bash
