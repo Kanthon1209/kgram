@@ -16,7 +16,11 @@ services:
       - "8080:8080"
     environment:
       GATEWAY_ADDR: ":8080"
-      # LIVEKIT_API_KEY / LIVEKIT_API_SECRET 从 .env 注入，勿写入仓库
+      OPENIM_API_URL: http://host.docker.internal:10002
+      OPENIM_CHAT_URL: http://host.docker.internal:10008
+      OPENIM_WS_URL: ws://host.docker.internal:10001
+      OPENIM_MINIO_URL: http://host.docker.internal:10005
+      # OPENIM_SECRET / LIVEKIT_* 从 .env 注入，勿写入仓库
     profiles:
       - dev
 

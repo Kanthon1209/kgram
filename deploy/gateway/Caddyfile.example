@@ -1,0 +1,10 @@
+# Optional: terminate TLS with Caddy in front of the gateway HTTP port.
+# Needs a public domain and port 80/443 open. The current demo ECS has neither.
+#
+#   caddy run --config Caddyfile
+#
+# Replace example.com with a real domain you control. Do not invent one.
+
+# example.com {
+#     reverse_proxy 127.0.0.1:8080
+# }
