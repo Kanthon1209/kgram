@@ -26,9 +26,29 @@ type recordedCall struct {
 }
 
 type recordingOpenIM struct {
-	mu     sync.Mutex
-	calls  []recordedCall
-	wsHits int
+	mu           sync.Mutex
+	calls        []recordedCall
+	wsHits       int
+	friendVerify bool
+	adminUser    string
+	friends      friendBook
+}
+
+type friendBook map[string]map[string]bool
+
+func (b friendBook) add(a, c string) {
+	if b[a] == nil {
+		b[a] = map[string]bool{}
+	}
+	if b[c] == nil {
+		b[c] = map[string]bool{}
+	}
+	b[a][c] = true
+	b[c][a] = true
+}
+
+func (b friendBook) areFriends(sendID, recvID string) bool {
+	return b[sendID][recvID]
 }
 
 func (f *recordingOpenIM) snapshot() []recordedCall {
@@ -115,6 +135,17 @@ func (f *recordingOpenIM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"errCode":403,"errMsg":"only app manager can send message"}`))
 			return
 		}
+		sendID, _ := body["sendID"].(string)
+		recvID, _ := body["recvID"].(string)
+		if err := openIMSingleChatFriendVerify(f.friendVerify, f.adminUser, sendID, recvID, f.friends.areFriends); err != nil {
+			if err == errNotPeersFriend {
+				_, _ = w.Write([]byte(`{"errCode":1303,"errMsg":"NotPeersFriend"}`))
+				return
+			}
+			b, _ := json.Marshal(map[string]any{"errCode": 1001, "errMsg": err.Error()})
+			_, _ = w.Write(b)
+			return
+		}
 		b, _ := json.Marshal(map[string]any{"errCode": 0, "data": body})
 		_, _ = w.Write(b)
 	case "/friend/add_friend", "/friend/add_friend_response":
@@ -129,7 +160,7 @@ func (f *recordingOpenIM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func newRecordingGateway(t *testing.T) (*httptest.Server, *recordingOpenIM) {
 	t.Helper()
-	fake := &recordingOpenIM{}
+	fake := &recordingOpenIM{friendVerify: true, adminUser: "imAdmin", friends: friendBook{}}
 	return newTestGateway(t, fake), fake
 }
 
@@ -244,23 +275,45 @@ func TestFriendRespondForcesToUserIDToTokenSubject(t *testing.T) {
 	}
 }
 
-func TestFriendRespondDefaultHandleResultAgrees(t *testing.T) {
-	// Current code: handleResult 0 is treated as unset and defaults to 1 (agree).
+func TestFriendRespondRejectsMissingZeroAndInvalidHandleResult(t *testing.T) {
+	// OpenIM RespondFriendApply accepts only 1 (agree) and -1 (refuse).
+	gw, fake := newRecordingGateway(t)
+	cases := []string{
+		`{"fromUserID":"alice"}`,
+		`{"fromUserID":"alice","handleResult":0}`,
+		`{"fromUserID":"alice","handleResult":2}`,
+		`{"fromUserID":"alice","handleResult":99}`,
+	}
+	for _, body := range cases {
+		code, env, _ := postAuth(t, gw.URL+"/v1/friends/respond", "user-bob", body)
+		if code != http.StatusBadRequest || env.ErrCode != 1001 {
+			t.Errorf("body %s: expected 400/1001, got %d %+v", body, code, env)
+		}
+	}
+	if fake.last("/friend/add_friend_response") != nil {
+		t.Fatal("invalid handleResult must not be forwarded upstream")
+	}
+}
+
+func TestFriendRespondAcceptsAgreeAndRefuse(t *testing.T) {
 	gw, fake := newRecordingGateway(t)
 	code, env, _ := postAuth(t, gw.URL+"/v1/friends/respond", "user-bob",
-		`{"fromUserID":"alice","handleResult":0}`)
+		`{"fromUserID":"alice","handleResult":1}`)
 	if code != 200 || env.ErrCode != 0 {
-		t.Fatalf("unexpected %d %+v", code, env)
+		t.Fatalf("agree: %d %+v", code, env)
 	}
 	got := fake.last("/friend/add_friend_response")
-	if got == nil {
-		t.Fatal("expected add_friend_response")
+	if got == nil || got.Body["handleResult"] != float64(1) || got.Body["toUserID"] != "bob" {
+		t.Fatalf("agree upstream %+v", got)
 	}
-	if got.Body["toUserID"] != "bob" {
-		t.Fatalf("toUserID=%#v", got.Body["toUserID"])
+	code, env, _ = postAuth(t, gw.URL+"/v1/friends/respond", "user-bob",
+		`{"fromUserID":"alice","handleResult":-1}`)
+	if code != 200 || env.ErrCode != 0 {
+		t.Fatalf("refuse: %d %+v", code, env)
 	}
-	if v, ok := got.Body["handleResult"].(float64); !ok || v != 1 {
-		t.Fatalf("handleResult 0 currently defaults to 1, got %#v", got.Body["handleResult"])
+	got = fake.last("/friend/add_friend_response")
+	if got == nil || got.Body["handleResult"] != float64(-1) {
+		t.Fatalf("refuse upstream %+v", got)
 	}
 }
 
@@ -494,5 +547,164 @@ func TestWSAuthFrameRejectsNonAuthMessage(t *testing.T) {
 	}
 	if fake.wsHits != 0 {
 		t.Fatal("non-auth first frame must not reach OpenIM WS")
+	}
+}
+
+
+func TestSendForwardsNotPeersFriendWhenFriendVerifyOn(t *testing.T) {
+	gw, fake := newRecordingGateway(t)
+	// alice and carol are not friends. Admin token must not skip this check:
+	// OpenIM messageVerification uses MsgData.SendID, not the caller identity.
+	code, env, _ := postAuth(t, gw.URL+"/v1/messages/send", "user-alice",
+		`{"recvID":"carol","text":"hi","clientMsgID":"c-nf"}`)
+	if code != 200 || env.ErrCode != openIMNotPeersFriend {
+		t.Fatalf("expected HTTP 200 with errCode 1303, got %d %+v", code, env)
+	}
+	got := fake.last("/msg/send_msg")
+	if got == nil {
+		t.Fatal("send should still reach OpenIM send_msg so friendVerify can run")
+	}
+	if got.Token != "admin-token" {
+		t.Fatalf("gateway uses admin token, got %q", got.Token)
+	}
+	if got.Body["sendID"] != "alice" {
+		t.Fatalf("friendVerify identity must be token subject sendID, got %#v", got.Body["sendID"])
+	}
+}
+
+func TestSendSucceedsWhenFriendVerifyFindsFriendship(t *testing.T) {
+	gw, fake := newRecordingGateway(t)
+	fake.friends.add("alice", "bob")
+	code, env, _ := postAuth(t, gw.URL+"/v1/messages/send", "user-alice",
+		`{"recvID":"bob","text":"hi","clientMsgID":"c-ok"}`)
+	if code != 200 || env.ErrCode != 0 {
+		t.Fatalf("friends should be able to send, got %d %+v", code, env)
+	}
+	got := fake.last("/msg/send_msg")
+	if got == nil || got.Body["sendID"] != "alice" || got.Body["recvID"] != "bob" {
+		t.Fatalf("upstream send %+v", got)
+	}
+}
+
+func TestSendDoesNotTreatAdminTokenAsFriendVerifySkip(t *testing.T) {
+	gw, fake := newRecordingGateway(t)
+	// Body tries to claim sendID=imAdmin, which would skip friendVerify in OpenIM.
+	// Gateway must force sendID to alice, so the skip must not apply.
+	code, env, _ := postAuth(t, gw.URL+"/v1/messages/send", "user-alice",
+		`{"sendID":"imAdmin","recvID":"carol","text":"hi"}`)
+	if env.ErrCode != openIMNotPeersFriend {
+		t.Fatalf("expected 1303 after sendID rewrite, got %d %+v", code, env)
+	}
+	got := fake.last("/msg/send_msg")
+	if got == nil || got.Body["sendID"] != "alice" {
+		t.Fatalf("sendID must not remain imAdmin, got %+v", got)
+	}
+}
+
+func TestIMProxyBlocksNormalizedBypassPaths(t *testing.T) {
+	gw, fake := newRecordingGateway(t)
+	paths := []string{
+		"/im/friend/import_friend",
+		"/im/friend/import_friend/",
+		"/im//friend/import_friend",
+		"/im/./friend/import_friend",
+		"/im/foo/../friend/import_friend",
+		"/im/../friend/import_friend",
+		"/im/friend/import_friend%2fextra",
+		"/im/friend/%2e%2e/import_friend",
+	}
+	for _, path := range paths {
+		req, err := http.NewRequest(http.MethodPost, gw.URL+path, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		// Requests that still match /im/* must be 403. A path like
+		// /im/../friend/import_friend may be cleaned by ServeMux to a
+		// non-proxy route and 404; that is acceptable only if it never
+		// reaches OpenIM (checked below).
+		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: expected 403 or 404, got %d %s", path, resp.StatusCode, raw)
+		}
+		if strings.Contains(path, "/im/../") && resp.StatusCode == http.StatusNotFound {
+			continue
+		}
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: expected 403, got %d %s", path, resp.StatusCode, raw)
+		}
+	}
+	for _, p := range fake.paths() {
+		if p == "/friend/import_friend" || strings.HasSuffix(p, "import_friend") {
+			t.Errorf("blocked import_friend reached upstream as %s", p)
+		}
+	}
+}
+
+func TestChatProxyBlocksAdminAndCallbackPaths(t *testing.T) {
+	gw, fake := newRecordingGateway(t)
+	paths := []string{
+		"/chat/callback/open_im",
+		"/chat/account/add_admin",
+		"/chat/account/add_user",
+		"/chat/user/import/json",
+		"/chat/user/password/reset",
+		"/chat/config/get_config",
+		"/chat/restart",
+		"/chat/block/add",
+		"/chat//account/add_admin",
+		"/chat/foo/../account/add_admin",
+	}
+	for _, path := range paths {
+		req, _ := http.NewRequest(http.MethodPost, gw.URL+path, strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: expected 403, got %d %s", path, resp.StatusCode, raw)
+		}
+	}
+	// User login on the Chat API must remain reachable.
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/chat/account/login", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("user /chat/account/login must not be blocked")
+	}
+	_ = fake
+}
+
+func TestChatProxyAllowsClientConfigGetButBlocksSet(t *testing.T) {
+	gw, _ := newRecordingGateway(t)
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/chat/client_config/set", strings.NewReader(`{}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("set should be forbidden, got %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodPost, gw.URL+"/chat/client_config/get", strings.NewReader(`{}`))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("user client_config/get must not be blocked")
 	}
 }

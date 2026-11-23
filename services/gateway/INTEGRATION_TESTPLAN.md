@@ -1,21 +1,28 @@
-# OpenIM compatibility tests (planned, not run this round)
+# OpenIM compatibility tests
 
-These cases need a **separate** OpenIM test environment with `friendVerify` enabled.
-Do not run them against the demo server or production data.
+## Ran this round
 
-## Must hold
+- Gateway unit/contract tests with a **fake** OpenIM that encodes
+  `messageVerification` / `RespondFriendApply` from local OpenIM Server
+  **v3.8.3-patch.16** (same `SendID`-based friendVerify check is in the
+  verified v3.8.3-patch.18 tree).
+- These tests do **not** start a live OpenIM process. Docker was unavailable
+  on the box, and the demo host `8.136.150.149` must not be used.
 
-- `friendVerify` is on.
-- The client and gateway never silently call `/friend/import_friend`.
+## Not run this round
+
+- Real OpenIM Server + Chat in Docker or any other isolated compose stack.
+- Any request to the demo ECS or production data.
+
+## Must hold when a real isolated stack is available
+
+- Server `friendVerify` is **on**. Official OpenIM default in
+  `config/openim-rpc-msg.yml` is `false`; kgram requires it enabled.
+- Admin-token `POST /msg/send_msg` still friend-checks `MsgData.SendID`
+  against `RecvID` (not the admin caller). Skip only if `SendID` is an
+  IM admin user ID. Expect `errCode` 1303 `NotPeersFriend` otherwise.
+- `handleResult` is only `1` (agree) or `-1` (refuse). `0` / omitted / other
+  values must fail, not default to agree.
+- No silent `/friend/import_friend`.
 - Message, read-receipt, and conversation updates are event/WS driven, not polling.
-- The Android client does not connect to official Telegram DCs.
-
-## First batch (after this gateway unit-test baseline)
-
-1. Auth: user A's token cannot send, read, or answer friend requests as B; expired/invalid tokens are rejected.
-2. Friends: A cannot message B before B accepts; apply / reject / accept then send; history and chat open do not auto-import a friend.
-3. Send/history: the same `clientMsgID` appears once; history pagination does not drop or duplicate; messages sent while disconnected are recovered after reconnect.
-4. Read cursor: hasReadSeq does not move backwards on duplicate or out-of-order notices; a user cannot read another conversation's cursor.
-5. Account isolation and connection state are client concerns, covered in later Android checks (no full app build in this step).
-
-Gateway unit tests with a fake OpenIM cannot prove friendVerify: `/v1/messages/send` currently uses the admin `/msg/send_msg` API after rewriting `sendID`. That behavior must be checked against a real OpenIM with friendVerify on.
+- The Android client does not connect to official Telegram DCs (client work, later).
