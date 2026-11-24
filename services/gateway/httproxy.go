@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 )
@@ -22,12 +23,103 @@ var blockedIMPaths = []string{
 	"/msg/send_business_notification",
 }
 
-func isBlockedIMPath(path string) bool {
+// Admin or server-to-server Chat routes that must not be reachable through /chat,
+// including if OPENIM_CHAT_URL is pointed at the admin API port by mistake.
+// User login/register and /client_config/get stay allowed.
+var blockedChatPaths = []string{
+	"/callback",
+	"/account/update",
+	"/account/info",
+	"/account/change_password",
+	"/account/add_admin",
+	"/account/add_user",
+	"/account/del_admin",
+	"/account/search",
+	"/user/import",
+	"/user/allow_register",
+	"/user/password/reset",
+	"/default",
+	"/invitation_code",
+	"/forbidden",
+	"/block",
+	"/statistic",
+	"/config",
+	"/restart",
+	"/applet/add",
+	"/applet/del",
+	"/applet/update",
+	"/applet/search",
+	"/client_config/set",
+	"/client_config/del",
+	"/application/add_version",
+	"/application/update_version",
+	"/application/delete_version",
+}
+
+func isBlockedPath(path string, blocked []string) bool {
 	p := strings.TrimSuffix(path, "/")
-	for _, b := range blockedIMPaths {
+	if p == "" {
+		p = "/"
+	}
+	for _, b := range blocked {
 		if p == b || strings.HasPrefix(p, b+"/") {
 			return true
 		}
+	}
+	return false
+}
+
+func isBlockedIMPath(path string) bool {
+	return isBlockedPath(path, blockedIMPaths)
+}
+
+func isBlockedChatPath(path string) bool {
+	return isBlockedPath(path, blockedChatPaths)
+}
+
+func pathEncodingForbidden(escaped string) bool {
+	e := strings.ToLower(escaped)
+	return strings.Contains(e, "%2f") || strings.Contains(e, "%5c") || strings.Contains(e, "%2e")
+}
+
+func cleanRequestPath(p string) string {
+	p = strings.TrimSpace(p)
+	p = strings.ReplaceAll(p, "\\", "/")
+	if p == "" {
+		p = "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return path.Clean(p)
+}
+
+// apiPathAfterPrefix returns the cleaned upstream API path (prefix stripped
+// when present). If cleaning escapes the prefix (e.g. /im/../auth/...), the
+// cleaned absolute path is returned so block lists still apply.
+func apiPathAfterPrefix(fullPath, stripPrefix string) string {
+	cleaned := cleanRequestPath(fullPath)
+	if stripPrefix != "" && (cleaned == stripPrefix || strings.HasPrefix(cleaned, stripPrefix+"/")) {
+		p := strings.TrimPrefix(cleaned, stripPrefix)
+		if p == "" {
+			return "/"
+		}
+		return p
+	}
+	return cleaned
+}
+
+func rejectUnsafeProxyRequest(w http.ResponseWriter, r *http.Request, stripPrefix string, blocked func(string) bool) bool {
+	if pathEncodingForbidden(r.URL.EscapedPath()) {
+		writeErr(w, http.StatusForbidden, 403, "invalid path")
+		return true
+	}
+	cleaned := cleanRequestPath(r.URL.Path)
+	r.URL.Path = cleaned
+	r.URL.RawPath = ""
+	if blocked(apiPathAfterPrefix(cleaned, stripPrefix)) {
+		writeErr(w, http.StatusForbidden, 403, "this API is not available to clients")
+		return true
 	}
 	return false
 }
@@ -42,14 +134,15 @@ func newPrefixProxy(targetBase, stripPrefix, publicGateway, minioPublic string) 
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
 		req.Host = target.Host
-		path := req.URL.Path
-		if stripPrefix != "" && (path == stripPrefix || strings.HasPrefix(path, stripPrefix+"/")) {
-			path = strings.TrimPrefix(path, stripPrefix)
-			if path == "" {
-				path = "/"
+		p := cleanRequestPath(req.URL.Path)
+		if stripPrefix != "" && (p == stripPrefix || strings.HasPrefix(p, stripPrefix+"/")) {
+			p = strings.TrimPrefix(p, stripPrefix)
+			if p == "" {
+				p = "/"
 			}
-			req.URL.Path = path
 		}
+		req.URL.Path = p
+		req.URL.RawPath = ""
 		req.URL.Host = target.Host
 		req.URL.Scheme = target.Scheme
 		// Do not forward hop-by-hop leftovers; preserve token / operationID.
@@ -80,18 +173,16 @@ func int64String(n int64) string {
 }
 
 func (s *server) handleIMProxy(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/im")
-	if path == "" {
-		path = "/"
-	}
-	if isBlockedIMPath(path) {
-		writeErr(w, http.StatusForbidden, 403, "this OpenIM API is not available to clients")
+	if rejectUnsafeProxyRequest(w, r, "/im", isBlockedIMPath) {
 		return
 	}
 	s.imProxy.ServeHTTP(w, r)
 }
 
 func (s *server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
+	if rejectUnsafeProxyRequest(w, r, "/chat", isBlockedChatPath) {
+		return
+	}
 	s.chatProxy.ServeHTTP(w, r)
 }
 

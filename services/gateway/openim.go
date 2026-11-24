@@ -13,9 +13,18 @@ import (
 
 const (
 	openIMAlreadyFriends = 1304
-	adminTokenTTL        = 50 * time.Minute
-	httpTimeout          = 20 * time.Second
+	// Official OpenIM protocol constants (github.com/openimsdk/protocol/constant):
+	// FriendResponseAgree=1, FriendResponseRefuse=-1. Other values are invalid.
+	openIMFriendResponseAgree  = 1
+	openIMFriendResponseRefuse = -1
+	openIMNotPeersFriend       = 1303
+	adminTokenTTL              = 50 * time.Minute
+	httpTimeout                = 20 * time.Second
 )
+
+func validFriendHandleResult(v int) bool {
+	return v == openIMFriendResponseAgree || v == openIMFriendResponseRefuse
+}
 
 type openIMClient struct {
 	apiBase    string

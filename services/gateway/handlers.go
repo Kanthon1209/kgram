@@ -144,8 +144,11 @@ func (s *server) handleFriendRespond(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, 1001, "fromUserID is required")
 		return
 	}
-	if req.HandleResult == 0 {
-		req.HandleResult = 1 // default: agree
+	// OpenIM RespondFriendApply accepts only 1 (agree) and -1 (refuse).
+	// A missing or zero handleResult must not default to agree.
+	if !validFriendHandleResult(req.HandleResult) {
+		writeErr(w, http.StatusBadRequest, 1001, "handleResult must be 1 (agree) or -1 (refuse)")
+		return
 	}
 	env, err := s.openim.respondFriend(token, from, claims.UserID, req.HandleResult, req.HandleMsg)
 	if err != nil {
