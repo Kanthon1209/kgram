@@ -1,0 +1,27 @@
+# Optional compose snippet for the kgram gateway.
+# Build the binary on a development machine (not on the 2Gi demo ECS):
+#   docker compose -f deploy/gateway/docker-compose.yml build
+# Then copy the image or the static binary to the server.
+#
+# Preferred on the tight demo VM: compile a static binary elsewhere
+#   CGO_ENABLED=0 go build -o kgram-gateway ./services/gateway
+# and run it with the env file (see README.md). Do not restart OpenIM.
+
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/gateway/Dockerfile
+    ports:
+      - "8443:8443"
+    env_file:
+      - .env
+    environment:
+      GATEWAY_ADDR: "127.0.0.1:8080"
+      GATEWAY_TLS_ADDR: ":8443"
+    volumes:
+      - /etc/kgram/tls:/etc/kgram/tls:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    # network_mode: host   # uncomment if the gateway should use 127.0.0.1 OpenIM ports directly

@@ -54,3 +54,9 @@ docker compose down               # full stop
 
 Full stack (deps + openim-server + openim-chat) is **tight / may OOM**.  
 If SSH dies after starting chat: reboot ECS in Aliyun console, then start **without** LiveKit/UI; prefer **4Gi** upgrade.
+
+## kgram 网关（安全底座，2026-11-19）
+
+客户端新版本应走网关的 HTTPS / WSS，而不是直接打上面的明文端口。网关部署与 TLS 步骤见 [../gateway/README.md](../gateway/README.md)。
+
+在演示 ECS 完成证书和安全组放行之前，网关可能尚未在线；明文 OpenIM 端口仍仅供运维和过渡使用。

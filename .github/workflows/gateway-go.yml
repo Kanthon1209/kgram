@@ -1,0 +1,27 @@
+name: gateway-go
+
+on:
+  push:
+    paths:
+      - "services/gateway/**"
+      - ".github/workflows/gateway-go.yml"
+  pull_request:
+    paths:
+      - "services/gateway/**"
+      - ".github/workflows/gateway-go.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/gateway/go.mod
+      - name: go test
+        run: go test ./... -count=1 -timeout=2m
+      - name: go vet
+        run: go vet ./...
